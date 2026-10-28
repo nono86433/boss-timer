@@ -1,0 +1,20 @@
+{
+  "name": "boss-timer-app",
+  "version": "1.0.0",
+  "description": "Boss respawn time tracker with multi-server and real-time synchronization",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "boss-timer",
+    "gaming",
+    "tracker"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.3.0",
+    "ws": "^8.22.0"
+  }
+}

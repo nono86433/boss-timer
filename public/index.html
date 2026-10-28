@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>⚔️ 王時間即時跨服追蹤器 (Boss Respawn Tracker)</title>
+  <meta name="description" content="支援S1~S60伺服器、即時共享、到期語音與音效提醒的王怪重生倒數工具">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header class="app-header">
+    <div class="header-container">
+      <div class="logo-section">
+        <div class="logo-icon">⚔️</div>
+        <div>
+          <h1 class="app-title">
+            王時間即時追蹤器
+            <span class="title-badge">S1~S60 多服同步</span>
+          </h1>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <!-- Live Connection Status -->
+        <div class="status-indicator" id="connStatus">
+          <span class="status-dot disconnected" id="connDot"></span>
+          <span id="connText">連線中...</span>
+        </div>
+
+        <!-- Sound & Voice Controls -->
+        <div class="sound-bar">
+          <button class="sound-toggle-btn" id="btnToggleSound" title="開關提示音效">🔔</button>
+          <button class="sound-toggle-btn" id="btnToggleVoice" title="開關國語語音播報">🗣️</button>
+          <select id="selectAlertMinutes" class="alert-select" title="設定提前幾分鐘提醒">
+            <option value="3">提前 3 分提醒</option>
+            <option value="5" selected>提前 5 分提醒</option>
+            <option value="10">提前 10 分提醒</option>
+          </select>
+          <button class="btn btn-secondary btn-sm" id="btnTestSound" title="測試提示音">測試提醒</button>
+        </div>
+
+        <!-- Quick Actions -->
+        <button class="btn btn-secondary btn-sm" id="btnOpenShare">📱 共享連線</button>
+        <button class="btn btn-secondary btn-sm" id="btnOpenBossManager">⚙️ 管理/新增王怪</button>
+
+        <!-- Current User Pill -->
+        <div class="user-pill" id="userPill">
+          <span>身分: <span class="user-name-highlight" id="lblUserName">未驗證</span></span>
+          <button class="btn-switch-user" id="btnSwitchUser">切換/登出</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container (Hidden until authenticated) -->
+  <main class="main-layout" id="mainAppContent" style="display: none;">
+    <!-- View Mode Switcher -->
+    <div class="view-tabs">
+      <button class="view-tab-btn active" id="tabServerView">
+        🏰 單一王怪追蹤看板 (<span id="lblCurrentBossNav">蘑菇王</span> - <span id="lblCurrentServerNav">S1</span>)
+      </button>
+      <button class="view-tab-btn" id="tabRadarView">
+        📡 全服出王雷達
+        <span class="radar-counter" id="lblRadarCount">0</span>
+      </button>
+      <button class="view-tab-btn" id="tabHistoryView">
+        📜 擊殺與異動紀錄
+      </button>
+    </div>
+
+    <!-- SERVER VIEW -->
+    <section id="sectionServerView">
+      <!-- STEP 1: TOP BOSS SELECTOR & QUICK ADD -->
+      <div class="top-boss-selector-card">
+        <div class="server-card-header" style="margin-bottom: 12px;">
+          <div class="server-card-title">
+            <span>👑 1. 先選擇或輸入要記錄的王怪（點選後下方僅顯示該隻王的紀錄）</span>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="btnQuickAddBoss">+ 新增 / 管理王怪設定</button>
+        </div>
+
+        <!-- Clickable Boss Tabs (Default: 蘑菇王, 殭屍姑姑王) -->
+        <div class="boss-tabs-bar" id="topBossTabs">
+          <!-- Rendered by JS -->
+        </div>
+
+        <!-- Inline Quick Add Boss Bar -->
+        <div class="inline-add-boss-bar">
+          <span class="inline-add-label">快速新增王怪：</span>
+          <input type="text" id="inlineNewBossName" class="form-input inline-input" placeholder="輸入新王怪名稱 (如: 巴洛古)">
+          <input type="number" id="inlineNewBossMinutes" class="form-input inline-input-sm" placeholder="復活分鐘" value="45" min="1">
+          <span style="font-size: 0.82rem; color: var(--text-secondary);">分鐘</span>
+          <button type="button" class="btn btn-primary btn-sm" id="btnInlineAddBoss">+ 新增並切換</button>
+        </div>
+      </div>
+
+      <!-- STEP 2: SERVER SELECTION (S1 ~ S60) FOR THE SELECTED BOSS -->
+      <div class="server-selection-card">
+        <div class="server-card-header">
+          <div class="server-card-title">
+            <span>🌐 2. 選擇伺服器 (S1 ~ S60) — 目前顯示【<span id="lblGridBossName" style="color: var(--accent-cyan);">蘑菇王</span>】各服倒數狀態</span>
+          </div>
+          <div class="server-range-tabs" id="serverRangeTabs">
+            <button class="range-tab-btn active" data-range="all">全部</button>
+            <button class="range-tab-btn" data-range="1-10">S1~10</button>
+            <button class="range-tab-btn" data-range="11-20">S11~20</button>
+            <button class="range-tab-btn" data-range="21-30">S21~30</button>
+            <button class="range-tab-btn" data-range="31-40">S31~40</button>
+            <button class="range-tab-btn" data-range="41-50">S41~50</button>
+            <button class="range-tab-btn" data-range="51-60">S51~60</button>
+          </div>
+        </div>
+        <div class="server-grid" id="serverGrid">
+          <!-- S1~S60 buttons generated by JS -->
+        </div>
+      </div>
+
+      <!-- STEP 3: SINGLE BOSS RECORD & COUNTDOWN FOR SELECTED SERVER -->
+      <div class="single-boss-workspace">
+        <!-- Left/Main: Single Boss Card + Input Form -->
+        <div id="singleBossContainer">
+          <!-- Populated by JS: Only shows the 1 selected boss on the selected server -->
+        </div>
+
+        <!-- Right/Side: Active Servers List for this Single Boss across S1~S60 -->
+        <div class="active-boss-servers-card">
+          <div class="server-card-header" style="margin-bottom: 10px;">
+            <div class="server-card-title">
+              <span>📋 【<span id="lblSummaryBossName" style="color: var(--accent-cyan);">蘑菇王</span>】已記錄的伺服器倒數一覽</span>
+            </div>
+            <span class="meta-tag" id="lblActiveBossServerCount">0 個伺服器倒數中</span>
+          </div>
+          <div id="singleBossServerList" class="single-boss-server-list">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RADAR VIEW (Cross-Server Spawning Soon) -->
+    <section id="sectionRadarView" style="display: none;">
+      <div class="server-selection-card">
+        <div class="server-card-header">
+          <div class="server-card-title">
+            <span>📡 全服即將出王雷達 (跨 S1 ~ S60 自動彙整)</span>
+          </div>
+          <div style="font-size: 0.85rem; color: var(--text-secondary);">
+            即將在 15 分鐘內復活或已重生之王怪，依時間排序
+          </div>
+        </div>
+        <div class="radar-table-container">
+          <table class="radar-table">
+            <thead>
+              <tr>
+                <th>伺服器</th>
+                <th>王怪名稱</th>
+                <th>重生倒數</th>
+                <th>預計重生時間</th>
+                <th>最後擊殺</th>
+                <th>狀態</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="radarTableBody">
+              <!-- Radar rows -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- HISTORY VIEW -->
+    <section id="sectionHistoryView" style="display: none;">
+      <div class="server-selection-card">
+        <div class="server-card-header">
+          <div class="server-card-title">
+            <span>📜 最近 100 筆擊殺回報紀錄</span>
+          </div>
+        </div>
+        <div class="radar-table-container">
+          <table class="radar-table">
+            <thead>
+              <tr>
+                <th>時間</th>
+                <th>伺服器</th>
+                <th>王怪名稱</th>
+                <th>類型</th>
+                <th>重生間隔</th>
+                <th>預計時間</th>
+                <th>回報人員</th>
+              </tr>
+            </thead>
+            <tbody id="historyTableBody">
+              <!-- Log rows -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- AUTHENTICATION MODAL (STRICT ACCESS CONTROL) -->
+  <div class="modal-overlay" id="modalAuth" style="display: flex;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>🔒 身分驗證 (查看與輸入資料前請先驗證)</span>
+        </div>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 16px;">
+          本工具提供跨裝置即時共享與王時間倒數提醒。請先輸入授權的指定名稱以驗證身分並查看資料：
+        </p>
+
+        <div class="form-group">
+          <label class="form-label">請輸入指定身分名稱：</label>
+          <input type="text" class="form-input" id="inputAuthName" placeholder="請輸入指定名稱進行驗證..." autocomplete="off">
+          <div class="auth-error-msg" id="lblAuthError">名稱驗證失敗：請輸入正確的指定名稱（「啞啞」或「森森」）才能查看與輸入資料！</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" id="btnSubmitAuth" style="width: 100%; justify-content: center; padding: 10px;">
+          🔓 驗證身分並查看資料
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- BOSS MANAGER MODAL (ADD / EDIT / DELETE BOSSES) -->
+  <div class="modal-overlay" id="modalBossManager" style="display: none;">
+    <div class="modal-card" style="max-width: 650px;">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>⚙️ 王怪設定與預設復活時間管理</span>
+        </div>
+        <button class="sound-toggle-btn" id="btnCloseBossManager">✕</button>
+      </div>
+      <div class="modal-body" style="max-height: 480px; overflow-y: auto;">
+        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 14px;">
+          預設提供「蘑菇王」與「殭屍姑姑王」，您可在此修改各王的預設復活時間（如 30分鐘、45分鐘、1小時），或新增其他王怪。
+        </p>
+
+        <!-- Current boss list -->
+        <div id="bossSettingsList" style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;">
+          <!-- Loaded dynamically -->
+        </div>
+
+        <!-- Add boss form -->
+        <div style="background: rgba(0,0,0,0.3); padding: 14px; border-radius: var(--radius-sm); border: 1px dashed var(--border-color);">
+          <div style="font-weight: 700; margin-bottom: 10px; font-size: 0.95rem; color: var(--accent-cyan);">+ 新增王怪與復活時間設定</div>
+          <div style="display: grid; grid-template-columns: 2fr 1.5fr; gap: 8px; margin-bottom: 8px;">
+            <input type="text" class="form-input" id="inputNewBossName" placeholder="王怪名稱 (例如: 巴洛古)">
+            <input type="number" class="form-input" id="inputNewBossMinutes" placeholder="復活分鐘 (如: 30 或 60)">
+          </div>
+          <div class="quick-tag-buttons" id="newBossRespawnPresets" style="margin-bottom: 10px;">
+            <span style="font-size: 0.8rem; color: var(--text-secondary); display: flex; align-items: center;">快速選擇復活時間：</span>
+            <button type="button" class="quick-tag-btn" data-new-respawn="30">30分鐘</button>
+            <button type="button" class="quick-tag-btn" data-new-respawn="45">45分鐘</button>
+            <button type="button" class="quick-tag-btn" data-new-respawn="60">1小時 (60分)</button>
+            <button type="button" class="quick-tag-btn" data-new-respawn="90">1.5小時 (90分)</button>
+            <button type="button" class="quick-tag-btn" data-new-respawn="120">2小時 (120分)</button>
+            <button type="button" class="quick-tag-btn" data-new-respawn="180">3小時 (180分)</button>
+            <button type="button" class="quick-tag-btn" data-new-respawn="240">4小時 (240分)</button>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
+            <input type="text" class="form-input" id="inputNewBossLoc" placeholder="出現地點 (選填)">
+            <input type="text" class="form-input" id="inputNewBossNote" placeholder="備忘筆記 (選填)">
+          </div>
+          <button class="btn btn-success btn-sm" id="btnSubmitNewBoss" style="width: 100%; justify-content: center; padding: 8px;">
+            + 確認新增此王怪
+          </button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="btnDoneBossManager">關閉</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SHARE / LAN CONNECTION MODAL -->
+  <div class="modal-overlay" id="modalShare" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>📱 手機 / 隊友連線共享資訊</span>
+        </div>
+        <button class="sound-toggle-btn" id="btnCloseShare">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 14px;">
+          本工具支援跨裝置即時共享！隊友或手機只要連線至同一網路，打開下方網址即可同步查看與操作：
+        </p>
+        <div id="networkLinksContainer" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px;">
+          <!-- IP list -->
+        </div>
+        <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); padding: 12px; border-radius: 8px; font-size: 0.85rem; color: var(--text-secondary);">
+          💡 提示：進入前須輸入指定名稱「啞啞」或「森森」驗證，任何人在任何裝置回報打死時間，所有人畫面皆會即時同步倒數與提醒！
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="btnDoneShare">關閉</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Scripts -->
+  <script src="js/sound.js"></script>
+  <script src="js/socket.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
