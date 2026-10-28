@@ -1,34 +1,39 @@
-// WebSocket Client with auto-reconnect and heartbeat
+// WebSocket Client with auto-reconnect and cloud sync fallback (for GitHub Pages)
 class LiveSocket {
   constructor(options = {}) {
-    this.url = options.url || `ws://${window.location.host}`;
+    this.isGitHubPages = window.location.hostname.endsWith('github.io');
+    this.cloudTopic = 'nono86433_boss_timer_sync_v1';
     this.onStatusChange = options.onStatusChange || (() => {});
     this.onMessage = options.onMessage || (() => {});
     this.currentUser = options.currentUser || null;
     this.ws = null;
     this.reconnectTimer = null;
-    this.pingInterval = null;
     this.isConnected = false;
   }
 
   setUser(user) {
     this.currentUser = user;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (!this.isGitHubPages && this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.sendAuth();
     }
   }
 
   connect() {
     if (this.ws) {
-      try { this.ws.close(); } catch(e) {}
+      try { this.ws.close(); } catch (e) {}
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
+    let wsUrl;
+    if (this.isGitHubPages) {
+      wsUrl = `wss://ntfy.sh/${this.cloudTopic}/ws`;
+    } else {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsUrl = `${protocol}//${window.location.host}`;
+    }
 
     try {
       this.ws = new WebSocket(wsUrl);
-    } catch(err) {
+    } catch (err) {
       console.error('WebSocket init error:', err);
       this.scheduleReconnect();
       return;
@@ -40,15 +45,23 @@ class LiveSocket {
       console.log('⚡ WebSocket 連線成功');
       this.isConnected = true;
       this.onStatusChange('connected');
-      if (this.currentUser) {
+      if (!this.isGitHubPages && this.currentUser) {
         this.sendAuth();
       }
     };
 
     this.ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data);
-        this.onMessage(data);
+        const raw = JSON.parse(event.data);
+        if (this.isGitHubPages) {
+          // ntfy.sh wraps payload in { event: 'message', message: '...' }
+          if (raw.event === 'message' && raw.message) {
+            const payload = JSON.parse(raw.message);
+            this.onMessage(payload);
+          }
+        } else {
+          this.onMessage(raw);
+        }
       } catch (e) {
         console.error('WS Parse message error:', e);
       }
@@ -62,12 +75,12 @@ class LiveSocket {
 
     this.ws.onerror = (err) => {
       console.warn('WS Error:', err);
-      try { this.ws.close(); } catch(e) {}
+      try { this.ws.close(); } catch (e) {}
     };
   }
 
   sendAuth() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.currentUser) {
+    if (!this.isGitHubPages && this.ws && this.ws.readyState === WebSocket.OPEN && this.currentUser) {
       this.ws.send(JSON.stringify({
         type: 'AUTH',
         name: this.currentUser
@@ -75,16 +88,21 @@ class LiveSocket {
     }
   }
 
-  send(data) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
+  async broadcastCloud(payload) {
+    if (!this.isGitHubPages) return;
+    try {
+      await fetch(`https://ntfy.sh/${this.cloudTopic}`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      console.warn('Cloud broadcast error:', e);
     }
   }
 
   scheduleReconnect() {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
-      console.log('🔄 嘗試重新連線 WebSocket...');
       this.connect();
     }, 3000);
   }

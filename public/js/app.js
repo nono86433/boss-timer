@@ -2,13 +2,33 @@
 (function () {
   'use strict';
 
+  const isGitHubPages = window.location.hostname.endsWith('github.io');
+  const DEFAULT_BOSSES = [
+    {
+      id: 'boss_mushmom',
+      name: '蘑菇王',
+      respawnMinutes: 45,
+      location: '',
+      note: '',
+      color: '#f97316'
+    },
+    {
+      id: 'boss_zombiemushmom',
+      name: '殭屍姑姑王',
+      respawnMinutes: 45,
+      location: '',
+      note: '',
+      color: '#a855f7'
+    }
+  ];
+
   // Application State
   const state = {
     currentUser: localStorage.getItem('boss_tracker_user') || null,
     config: {
       authNames: ['啞啞', '森森'],
       servers: Array.from({ length: 60 }, (_, i) => `S${i + 1}`),
-      bosses: []
+      bosses: DEFAULT_BOSSES
     },
     records: {},
     logs: [],
@@ -124,6 +144,15 @@
     }
   });
 
+  function saveLocalCloudCache() {
+    if (!isGitHubPages) return;
+    try {
+      localStorage.setItem('boss_cloud_config', JSON.stringify(state.config));
+      localStorage.setItem('boss_cloud_records', JSON.stringify(state.records));
+      localStorage.setItem('boss_cloud_logs', JSON.stringify(state.logs));
+    } catch (e) {}
+  }
+
   // Handle incoming real-time socket events
   function handleSocketMessage(msg) {
     if (msg.type === 'RECORD_UPDATED') {
@@ -131,10 +160,11 @@
       if (!state.records[rec.serverId]) state.records[rec.serverId] = {};
       state.records[rec.serverId][rec.bossId] = rec;
 
-      if (msg.log) {
+      if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
         state.logs.unshift(msg.log);
         if (state.logs.length > 200) state.logs.pop();
       }
+      saveLocalCloudCache();
 
       showToast(`📢 ${rec.reporter} 更新了 [${rec.serverId}] ${rec.bossName} 的打死時間！`, 'info');
       renderTopBossTabs();
@@ -149,9 +179,11 @@
       if (state.records[msg.serverId]) {
         delete state.records[msg.serverId][msg.bossId];
       }
-      if (msg.log) {
+      if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
         state.logs.unshift(msg.log);
       }
+      saveLocalCloudCache();
+
       const bName = msg.bossName || (msg.log && msg.log.bossName) || '王怪';
       const rep = msg.reporter || (msg.log && msg.log.reporter) || '';
       showToast(`🔄 [${msg.serverId}] ${bName} 紀錄已被 ${rep} 清除`, 'info');
@@ -165,6 +197,7 @@
       if (state.currentView === 'history') renderHistoryView();
     } else if (msg.type === 'CONFIG_UPDATED') {
       state.config = msg.config;
+      saveLocalCloudCache();
       getActiveBoss();
       renderTopBossTabs();
       renderBossManagerList();
@@ -175,11 +208,15 @@
     }
   }
 
-  // API helper with authentication header
+  // API helper with authentication header & GitHub Pages Cloud Sync Mode
   async function apiFetch(endpoint, options = {}) {
     if (!state.currentUser) {
       promptAuth();
       throw new Error('請先完成身分驗證');
+    }
+
+    if (isGitHubPages) {
+      return await handleCloudApi(endpoint, options);
     }
 
     const headers = options.headers || {};
@@ -199,6 +236,178 @@
     }
 
     return await res.json();
+  }
+
+  // Cloud Sync Handler when hosted on GitHub Pages
+  async function handleCloudApi(endpoint, options = {}) {
+    const body = options.body ? JSON.parse(options.body) : {};
+
+    if (endpoint === '/api/state') {
+      try {
+        const savedCfg = localStorage.getItem('boss_cloud_config');
+        if (savedCfg) state.config = JSON.parse(savedCfg);
+        const savedRec = localStorage.getItem('boss_cloud_records');
+        if (savedRec) state.records = JSON.parse(savedRec);
+        const savedLogs = localStorage.getItem('boss_cloud_logs');
+        if (savedLogs) state.logs = JSON.parse(savedLogs);
+      } catch (e) {}
+
+      // Fetch recent events from ntfy.sh cloud history
+      try {
+        const res = await fetch(`https://ntfy.sh/${liveSocket.cloudTopic}/json?poll=1&since=24h`);
+        const text = await res.text();
+        const lines = text.trim().split('\n').filter(Boolean);
+        lines.forEach(line => {
+          try {
+            const evt = JSON.parse(line);
+            if (evt.event === 'message' && evt.message) {
+              const msg = JSON.parse(evt.message);
+              if (msg.type === 'RECORD_UPDATED' && msg.record) {
+                const r = msg.record;
+                if (!state.records[r.serverId]) state.records[r.serverId] = {};
+                state.records[r.serverId][r.bossId] = r;
+                if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
+                  state.logs.unshift(msg.log);
+                }
+              } else if (msg.type === 'RECORD_CLEARED') {
+                if (state.records[msg.serverId]) delete state.records[msg.serverId][msg.bossId];
+                if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
+                  state.logs.unshift(msg.log);
+                }
+              } else if (msg.type === 'CONFIG_UPDATED' && msg.config) {
+                state.config = msg.config;
+              }
+            }
+          } catch (e) {}
+        });
+        saveLocalCloudCache();
+      } catch (e) {}
+
+      return {
+        success: true,
+        config: state.config,
+        records: state.records,
+        logs: state.logs.slice(0, 100)
+      };
+    }
+
+    if (endpoint === '/api/record') {
+      const { serverId, bossId, killedAt, respawnMinutes, note } = body;
+      const kTime = killedAt ? Number(killedAt) : Date.now();
+      const rMinutes = Number(respawnMinutes) > 0 ? Number(respawnMinutes) : 45;
+      const respawnAt = kTime + rMinutes * 60 * 1000;
+      const bossDef = state.config.bosses.find(b => b.id === bossId) || { name: bossId };
+
+      const recordEntry = {
+        serverId,
+        bossId,
+        bossName: bossDef.name,
+        killedAt: kTime,
+        respawnMinutes: rMinutes,
+        respawnAt,
+        reporter: state.currentUser,
+        note: note || '',
+        updatedAt: Date.now()
+      };
+
+      if (!state.records[serverId]) state.records[serverId] = {};
+      state.records[serverId][bossId] = recordEntry;
+
+      const logEntry = {
+        id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        type: 'KILL',
+        serverId,
+        bossId,
+        bossName: bossDef.name,
+        killedAt: kTime,
+        respawnAt,
+        respawnMinutes: rMinutes,
+        reporter: state.currentUser,
+        note: note || '',
+        timestamp: Date.now()
+      };
+      state.logs.unshift(logEntry);
+      if (state.logs.length > 200) state.logs.pop();
+      saveLocalCloudCache();
+
+      liveSocket.broadcastCloud({
+        type: 'RECORD_UPDATED',
+        record: recordEntry,
+        log: logEntry
+      });
+
+      return { success: true, record: recordEntry };
+    }
+
+    if (endpoint === '/api/record/clear') {
+      const { serverId, bossId } = body;
+      const bossDef = state.config.bosses.find(b => b.id === bossId) || { name: bossId };
+      if (state.records[serverId]) delete state.records[serverId][bossId];
+
+      const logEntry = {
+        id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        type: 'CLEAR',
+        serverId,
+        bossId,
+        bossName: bossDef.name,
+        reporter: state.currentUser,
+        timestamp: Date.now()
+      };
+      state.logs.unshift(logEntry);
+      saveLocalCloudCache();
+
+      liveSocket.broadcastCloud({
+        type: 'RECORD_CLEARED',
+        serverId,
+        bossId,
+        bossName: bossDef.name,
+        reporter: state.currentUser,
+        log: logEntry
+      });
+
+      return { success: true };
+    }
+
+    if (endpoint === '/api/bosses') {
+      const { action, boss } = body;
+      if (action === 'add') {
+        const newBoss = {
+          id: `boss_${Date.now()}`,
+          name: boss.name.trim(),
+          respawnMinutes: Math.max(1, parseInt(boss.respawnMinutes, 10)),
+          location: boss.location ? boss.location.trim() : '',
+          note: boss.note ? boss.note.trim() : '',
+          color: boss.color || '#3b82f6'
+        };
+        state.config.bosses.push(newBoss);
+        saveLocalCloudCache();
+        liveSocket.broadcastCloud({ type: 'CONFIG_UPDATED', config: state.config });
+        return { success: true, boss: newBoss };
+      }
+      if (action === 'edit') {
+        const idx = state.config.bosses.findIndex(b => b.id === boss.id);
+        if (idx !== -1) {
+          state.config.bosses[idx] = {
+            ...state.config.bosses[idx],
+            name: boss.name.trim(),
+            respawnMinutes: Math.max(1, parseInt(boss.respawnMinutes, 10)),
+            location: boss.location ? boss.location.trim() : '',
+            note: boss.note ? boss.note.trim() : ''
+          };
+          saveLocalCloudCache();
+          liveSocket.broadcastCloud({ type: 'CONFIG_UPDATED', config: state.config });
+          return { success: true, boss: state.config.bosses[idx] };
+        }
+      }
+      if (action === 'delete') {
+        state.config.bosses = state.config.bosses.filter(b => b.id !== boss.id);
+        saveLocalCloudCache();
+        liveSocket.broadcastCloud({ type: 'CONFIG_UPDATED', config: state.config });
+        return { success: true };
+      }
+    }
+
+    return { success: true };
   }
 
   // Authentication Flow
@@ -230,6 +439,23 @@
     if (!name) {
       el.lblAuthError.textContent = '請輸入指定名稱（「啞啞」或「森森」）才能查看與輸入資料！';
       el.lblAuthError.style.display = 'block';
+      return;
+    }
+
+    if (isGitHubPages) {
+      if (state.config.authNames.includes(name)) {
+        state.currentUser = name;
+        localStorage.setItem('boss_tracker_user', state.currentUser);
+        el.lblUserName.textContent = state.currentUser;
+        el.modalAuth.style.display = 'none';
+        el.mainAppContent.style.display = 'block';
+        liveSocket.setUser(state.currentUser);
+        showToast(`🔓 身分驗證成功！歡迎，${state.currentUser}`, 'success');
+        initAppState();
+      } else {
+        el.lblAuthError.textContent = '名稱驗證失敗：僅限輸入「啞啞」或「森森」才能查看資料！';
+        el.lblAuthError.style.display = 'block';
+      }
       return;
     }
 
@@ -1175,17 +1401,18 @@
     el.networkLinksContainer.innerHTML = '載入網路位址中...';
     el.modalShare.style.display = 'flex';
 
-    try {
-      const res = await fetch('/api/network-info');
-      const data = await res.json();
-      el.networkLinksContainer.innerHTML = '';
+    el.networkLinksContainer.innerHTML = '';
+    addShareLink('🌐 GitHub 公開網頁版 (跨網路隨時可用)', 'https://nono86433.github.io/boss-timer/');
 
-      addShareLink('本機瀏覽器', `http://localhost:${data.port}`);
-      data.addresses.forEach(ip => {
-        addShareLink(`手機 / 區域網路共享 (Wi-Fi)`, `http://${ip}:${data.port}`);
-      });
-    } catch (e) {
-      el.networkLinksContainer.innerHTML = '無法取得網路資訊';
+    if (!isGitHubPages) {
+      try {
+        const res = await fetch('/api/network-info');
+        const data = await res.json();
+        addShareLink('本機瀏覽器', `http://localhost:${data.port}`);
+        data.addresses.forEach(ip => {
+          addShareLink(`手機 / 區域網路共享 (Wi-Fi / Radmin)`, `http://${ip}:${data.port}`);
+        });
+      } catch (e) {}
     }
   }
 
