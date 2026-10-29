@@ -5,7 +5,7 @@
   const isGitHubPages = window.location.hostname.endsWith('github.io');
   const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
   const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-  const SIXTY_ONE_MINS_MS = 61 * 60 * 1000;
+  const FIFTEEN_MINS_MS = 15 * 60 * 1000;
   const THIRTY_MINS_MS = 30 * 60 * 1000;
 
   const DEFAULT_BOSSES = [
@@ -211,7 +211,7 @@
       saveLocalCloudCache();
 
       if (msg.isAutoAdjust) {
-        showToast(`⚡ [${rec.serverId}] ${rec.bossName} 已超過 61 分鐘，自動改為剩餘 30 分鐘！`, 'warn');
+        showToast(`⚡ [${rec.serverId}] ${rec.bossName} 重生後 15 分鐘未編輯，自動改為倒數 30 分鐘！`, 'warn');
       } else {
         showToast(`📢 ${rec.reporter} 更新了 [${rec.serverId}] ${rec.bossName} 的打死時間！`, 'info');
       }
@@ -406,7 +406,7 @@
       const rMinutes = Number(respawnMinutes) > 0 ? Number(respawnMinutes) : 45;
       const respawnAt = kTime + rMinutes * 60 * 1000;
       const bossDef = state.config.bosses.find(b => b.id === bossId) || { name: bossId };
-      const reporter = isAutoAdjust ? '系統自動(61分轉30分)' : state.currentUser;
+      const reporter = isAutoAdjust ? '系統自動(重生15分轉倒數30分)' : state.currentUser;
 
       const recordEntry = {
         serverId,
@@ -939,7 +939,7 @@
 
       const killedTimeStr = formatTime(new Date(rec.killedAt));
       const respawnTimeStr = formatTime(new Date(rec.respawnAt));
-      const auto30Tag = rec.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 超過61分已自動改為剩餘30分</span>' : '';
+      const auto30Tag = rec.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 重生15分未編輯已改為倒數30分</span>' : '';
 
       if (diffMs <= 0) {
         statusClass = 'status-alive';
@@ -1224,7 +1224,7 @@
         ? `已重生 +${formatDuration(sec)}`
         : formatDuration(sec);
 
-      const auto30Badge = item.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 61分轉剩30分</span>' : '';
+      const auto30Badge = item.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 重生15分轉30分</span>' : '';
 
       row.className = `srv-summary-row ${item.serverId === state.activeServer ? 'active-srv' : ''}`;
       row.innerHTML = `
@@ -1277,7 +1277,7 @@
         if (!isAutoAdjust) {
           showToast(`✅ 已記錄 [${serverId}] ${res.record.bossName} 打死時間，開始倒數 ${formatMinutes(respawnMinutes)}！`, 'success');
         } else {
-          showToast(`⚡ [${serverId}] ${res.record.bossName} 超過 61 分鐘，已自動調整為剩餘 30 分鐘！`, 'warn');
+          showToast(`⚡ [${serverId}] ${res.record.bossName} 重生後 15 分鐘未編輯，已自動改為倒數 30 分鐘！`, 'warn');
         }
         if (!state.records[serverId]) state.records[serverId] = {};
         state.records[serverId][bossId] = res.record;
@@ -1401,7 +1401,7 @@
 
       tr.innerHTML = `
         <td><span class="radar-server-tag">${item.serverId}</span></td>
-        <td style="font-weight: 700;">${item.bossName} ${item.autoAdjusted30m ? '<span class="auto-30m-badge">61分轉30分</span>' : ''}</td>
+        <td style="font-weight: 700;">${item.bossName} ${item.autoAdjusted30m ? '<span class="auto-30m-badge">重生15分轉30分</span>' : ''}</td>
         <td style="font-family: var(--font-mono); font-weight: 700; color: ${isAlive ? 'var(--accent-green)' : 'var(--accent-yellow)'}">${countdownText}</td>
         <td>${formatTime(new Date(item.respawnAt))}</td>
         <td>${formatTime(new Date(item.killedAt))} (${item.reporter || '未知'})</td>
@@ -1444,7 +1444,7 @@
       if (log.type === 'KILL') {
         typeHtml = '<span style="color: var(--accent-green)">擊殺回報</span>';
       } else if (log.type === 'AUTO_30M') {
-        typeHtml = '<span style="color: var(--accent-yellow)">⚡ 超過61分改剩30分</span>';
+        typeHtml = '<span style="color: var(--accent-yellow)">⚡ 重生15分未編輯改倒數30分</span>';
       } else if (log.type === 'AUTO_RESET_3H') {
         typeHtml = '<span style="color: var(--accent-red)">⏰ 閒置3小時全服重置</span>';
       }
@@ -1518,10 +1518,10 @@
       Object.values(srvRecs).forEach(rec => {
         if (!rec || !rec.respawnAt) return;
 
-        // Rule 3: When a channel exceeds 61 minutes since killedAt, automatically set it to remaining 30 minutes
-        if (!rec.autoAdjusted30m && (now - rec.killedAt >= SIXTY_ONE_MINS_MS)) {
-          const newKilledAt = rec.killedAt + SIXTY_ONE_MINS_MS;
-          const newNote = rec.note ? `${rec.note} (超過61分自動改剩30分)` : '超過61分自動改為剩餘30分';
+        // Rule 3: When a channel is unedited for 15 minutes after boss respawn (respawnAt), automatically set it to countdown 30 minutes
+        if (!rec.autoAdjusted30m && (now - rec.respawnAt >= FIFTEEN_MINS_MS)) {
+          const newKilledAt = rec.respawnAt + FIFTEEN_MINS_MS;
+          const newNote = rec.note ? `${rec.note} (重生15分未編輯自動倒數30分)` : '重生後15分未編輯，自動改為倒數30分';
           rec.autoAdjusted30m = true;
           saveBossRecord(srv, rec.bossId, newKilledAt, 30, newNote, true);
           return;

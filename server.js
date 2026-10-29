@@ -19,7 +19,7 @@ const META_FILE = path.join(DATA_DIR, 'meta.json');
 
 const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-const SIXTY_ONE_MINS_MS = 61 * 60 * 1000;
+const FIFTEEN_MINS_MS = 15 * 60 * 1000;
 const THIRTY_MINS_MS = 30 * 60 * 1000;
 
 // Ensure data dir exists
@@ -103,18 +103,18 @@ function checkAutoRules() {
     if (!srvRecs) continue;
     for (const bossId of Object.keys(srvRecs)) {
       const rec = srvRecs[bossId];
-      if (!rec || !rec.killedAt) continue;
+      if (!rec || !rec.respawnAt) continue;
       hasAnyRecord = true;
 
-      // Rule 3: If channel exceeds 61 minutes since killedAt, automatically set to remaining 30 minutes
-      if (!rec.autoAdjusted30m && (now - rec.killedAt >= SIXTY_ONE_MINS_MS)) {
-        const newKilledAt = rec.killedAt + SIXTY_ONE_MINS_MS;
+      // Rule 3: If channel is unedited for 15 minutes after boss respawn (respawnAt), automatically set to countdown 30 minutes
+      if (!rec.autoAdjusted30m && (now - rec.respawnAt >= FIFTEEN_MINS_MS)) {
+        const newKilledAt = rec.respawnAt + FIFTEEN_MINS_MS;
         const newRespawnAt = newKilledAt + THIRTY_MINS_MS;
         rec.killedAt = newKilledAt;
         rec.respawnMinutes = 30;
         rec.respawnAt = newRespawnAt;
         rec.autoAdjusted30m = true;
-        rec.note = rec.note ? `${rec.note} (超過61分自動改剩30分)` : '超過61分自動改為剩餘30分';
+        rec.note = rec.note ? `${rec.note} (重生15分未編輯自動倒數30分)` : '重生後15分未編輯，自動改為倒數30分';
         recordsChanged = true;
 
         const logEntry = {
@@ -126,7 +126,7 @@ function checkAutoRules() {
           killedAt: newKilledAt,
           respawnAt: newRespawnAt,
           respawnMinutes: 30,
-          reporter: '系統自動(61分轉30分)',
+          reporter: '系統自動(重生15分轉倒數30分)',
           timestamp: now
         };
         logs.unshift(logEntry);
@@ -241,7 +241,7 @@ app.get('/api/state', checkAuth, (req, res) => {
 // API: Record boss kill time (protected)
 app.post('/api/record', checkAuth, (req, res) => {
   const { serverId, bossId, killedAt, respawnMinutes, note, isAutoAdjust } = req.body;
-  const reporter = isAutoAdjust ? '系統自動(61分轉30分)' : req.currentUser;
+  const reporter = isAutoAdjust ? '系統自動(重生15分轉倒數30分)' : req.currentUser;
 
   if (!serverId || !bossId) {
     return res.status(400).json({ success: false, error: '缺少 serverId 或 bossId' });
