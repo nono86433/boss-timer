@@ -106,15 +106,22 @@ function checkAutoRules() {
       if (!rec || !rec.respawnAt) continue;
       hasAnyRecord = true;
 
-      // Rule 3: If channel is unedited for 15 minutes after boss respawn (respawnAt), automatically set to countdown 30 minutes
-      if (!rec.autoAdjusted30m && (now - rec.respawnAt >= FIFTEEN_MINS_MS)) {
-        const newKilledAt = rec.respawnAt + FIFTEEN_MINS_MS;
-        const newRespawnAt = newKilledAt + THIRTY_MINS_MS;
+      // Rule 3: Whenever a channel is unedited for 15 minutes after boss respawn (respawnAt), automatically set to countdown 30 minutes (repeats every cycle until 3h reset)
+      if (now - rec.respawnAt >= FIFTEEN_MINS_MS) {
+        let newKilledAt = rec.killedAt;
+        let newRespawnAt = rec.respawnAt;
+        while (now - newRespawnAt >= FIFTEEN_MINS_MS) {
+          newKilledAt = newRespawnAt + FIFTEEN_MINS_MS;
+          newRespawnAt = newKilledAt + THIRTY_MINS_MS;
+        }
         rec.killedAt = newKilledAt;
         rec.respawnMinutes = 30;
         rec.respawnAt = newRespawnAt;
         rec.autoAdjusted30m = true;
-        rec.note = rec.note ? `${rec.note} (重生15分未編輯自動倒數30分)` : '重生後15分未編輯，自動改為倒數30分';
+        rec.updatedAt = now;
+        if (!rec.note || !rec.note.includes('自動')) {
+          rec.note = rec.note ? `${rec.note} (重生15分未編輯自動倒數30分)` : '重生後15分未編輯，自動改為倒數30分';
+        }
         recordsChanged = true;
 
         const logEntry = {
