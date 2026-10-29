@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>⚔️ 王時間即時跨服追蹤器 (Boss Respawn Tracker)</title>
-  <meta name="description" content="支援S1~S60伺服器、即時共享、到期語音與音效提醒的王怪重生倒數工具">
+  <meta name="description" content="支援S1~S60伺服器、即時共享、聊天室、到期語音與音效提醒的王怪重生倒數工具">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -27,6 +27,11 @@
         <div class="status-indicator" id="connStatus">
           <span class="status-dot disconnected" id="connDot"></span>
           <span id="connText">連線中...</span>
+        </div>
+
+        <!-- 3-Hour Inactivity Auto-Reset Countdown Pill -->
+        <div class="status-indicator" id="inactivityResetPill" title="當超過 3 小時沒有新增或刪改任何頻道資料，將自動重置所有頻道">
+          <span>⏳ 閒置重置: <strong id="lblInactivityTimer" style="color: var(--accent-cyan); font-family: var(--font-mono);">無紀錄</strong></span>
         </div>
 
         <!-- Sound & Voice Controls -->
@@ -78,7 +83,12 @@
           <div class="server-card-title">
             <span>👑 1. 先選擇或輸入要記錄的王怪（點選後下方僅顯示該隻王的紀錄）</span>
           </div>
-          <button class="btn btn-secondary btn-sm" id="btnQuickAddBoss">+ 新增 / 管理王怪設定</button>
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <span class="meta-tag" style="color: var(--accent-yellow); border: 1px solid rgba(245, 158, 11, 0.3);">
+              ⚡ 規則：單一頻道超過 61 分鐘自動改為剩餘 30 分鐘 ｜ 閒置 3 小時自動全服重置
+            </span>
+            <button class="btn btn-secondary btn-sm" id="btnQuickAddBoss">+ 新增 / 管理王怪設定</button>
+          </div>
         </div>
 
         <!-- Clickable Boss Tabs (Default: 蘑菇王, 殭屍姑姑王) -->
@@ -117,23 +127,58 @@
         </div>
       </div>
 
-      <!-- STEP 3: SINGLE BOSS RECORD & COUNTDOWN FOR SELECTED SERVER -->
+      <!-- STEP 3: SINGLE BOSS RECORD, ACTIVE SERVERS LIST & 24H CHAT ROOM -->
       <div class="single-boss-workspace">
         <!-- Left/Main: Single Boss Card + Input Form -->
         <div id="singleBossContainer">
           <!-- Populated by JS: Only shows the 1 selected boss on the selected server -->
         </div>
 
-        <!-- Right/Side: Active Servers List for this Single Boss across S1~S60 -->
-        <div class="active-boss-servers-card">
-          <div class="server-card-header" style="margin-bottom: 10px;">
-            <div class="server-card-title">
-              <span>📋 【<span id="lblSummaryBossName" style="color: var(--accent-cyan);">蘑菇王</span>】已記錄的伺服器倒數一覽</span>
+        <!-- Right/Side: Active Servers List + 24H Chat Room -->
+        <div class="right-column-stack">
+          <!-- Active Servers List for this Single Boss across S1~S60 -->
+          <div class="active-boss-servers-card">
+            <div class="server-card-header" style="margin-bottom: 10px;">
+              <div class="server-card-title">
+                <span>📋 【<span id="lblSummaryBossName" style="color: var(--accent-cyan);">蘑菇王</span>】已記錄頻道一覽</span>
+              </div>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <span class="meta-tag" id="lblActiveBossServerCount">0 個頻道</span>
+                <button type="button" class="btn btn-danger btn-sm" id="btnResetAllChannels" title="手動將所有頻道紀錄重置清空">🧹 全服重置</button>
+              </div>
             </div>
-            <span class="meta-tag" id="lblActiveBossServerCount">0 個伺服器倒數中</span>
+            <div id="singleBossServerList" class="single-boss-server-list">
+              <!-- Populated by JS -->
+            </div>
           </div>
-          <div id="singleBossServerList" class="single-boss-server-list">
-            <!-- Populated by JS -->
+
+          <!-- 24-Hour Real-time Chat Room -->
+          <div class="chat-room-card">
+            <div class="server-card-header" style="margin-bottom: 10px;">
+              <div class="server-card-title">
+                <span>💬 即時聊天室（啞啞 & 森森）</span>
+              </div>
+              <span class="meta-tag" style="color: var(--accent-green);">🕒 訊息自動保留 24 小時</span>
+            </div>
+
+            <!-- Chat Messages Box -->
+            <div class="chat-messages-box" id="chatMessagesBox">
+              <!-- Populated by JS -->
+            </div>
+
+            <!-- Quick Chat Phrases -->
+            <div class="chat-quick-phrases" id="chatQuickPhrases">
+              <button type="button" class="quick-tag-btn" data-chat-phrase="這頻有人在等">這頻有人在等</button>
+              <button type="button" class="quick-tag-btn" data-chat-phrase="被別人提前打死了">被別人提前打死了</button>
+              <button type="button" class="quick-tag-btn" data-chat-phrase="剛打完，換下一頻！">剛打完，換下一頻！</button>
+              <button type="button" class="quick-tag-btn" data-chat-phrase="出王了快來！">出王了快來！</button>
+            </div>
+
+            <!-- Chat Input Row -->
+            <div class="chat-input-row">
+              <input type="text" id="inputChatMessage" class="form-input" placeholder="輸入訊息與隊友溝通 (按 Enter 發送)..." autocomplete="off">
+              <button type="button" class="btn btn-primary" id="btnSendChat" style="white-space: nowrap;">發送 💬</button>
+            </div>
           </div>
         </div>
       </div>
@@ -176,7 +221,7 @@
       <div class="server-selection-card">
         <div class="server-card-header">
           <div class="server-card-title">
-            <span>📜 最近 100 筆擊殺回報紀錄</span>
+            <span>📜 最近 100 筆擊殺與系統重置紀錄</span>
           </div>
         </div>
         <div class="radar-table-container">
@@ -290,13 +335,13 @@
       </div>
       <div class="modal-body">
         <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 14px;">
-          本工具支援跨裝置即時共享！隊友或手機只要連線至同一網路，打開下方網址即可同步查看與操作：
+          本工具支援跨裝置即時共享！隊友或手機只要打開下方網址即可同步查看、記錄時間與聊天：
         </p>
         <div id="networkLinksContainer" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px;">
           <!-- IP list -->
         </div>
         <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); padding: 12px; border-radius: 8px; font-size: 0.85rem; color: var(--text-secondary);">
-          💡 提示：進入前須輸入指定名稱「啞啞」或「森森」驗證，任何人在任何裝置回報打死時間，所有人畫面皆會即時同步倒數與提醒！
+          💡 提示：進入前須輸入指定名稱「啞啞」或「森森」驗證，任何人在任何裝置回報打死時間或發送聊天訊息，所有人畫面皆會即時同步！
         </div>
       </div>
       <div class="modal-footer">

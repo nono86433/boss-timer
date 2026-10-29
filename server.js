@@ -14,6 +14,13 @@ const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const RECORDS_FILE = path.join(DATA_DIR, 'records.json');
 const LOGS_FILE = path.join(DATA_DIR, 'logs.json');
+const CHATS_FILE = path.join(DATA_DIR, 'chats.json');
+const META_FILE = path.join(DATA_DIR, 'meta.json');
+
+const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+const SIXTY_ONE_MINS_MS = 61 * 60 * 1000;
+const THIRTY_MINS_MS = 30 * 60 * 1000;
 
 // Ensure data dir exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -40,7 +47,7 @@ function writeJSON(file, data) {
   }
 }
 
-let config = readJSON(CONFIG_FILE, {
+const DEFAULT_CONFIG = {
   authNames: ["啞啞", "森森"],
   servers: Array.from({ length: 60 }, (_, i) => `S${i + 1}`),
   bosses: [
@@ -61,10 +68,113 @@ let config = readJSON(CONFIG_FILE, {
       color: "#a855f7"
     }
   ]
-});
+};
+
+let config = readJSON(CONFIG_FILE, DEFAULT_CONFIG);
+// Ensure default bosses exist without wiping user-added bosses
+if (!config.bosses || config.bosses.length === 0) {
+  config.bosses = DEFAULT_CONFIG.bosses;
+  writeJSON(CONFIG_FILE, config);
+}
 
 let records = readJSON(RECORDS_FILE, {});
 let logs = readJSON(LOGS_FILE, []);
+let chats = readJSON(CHATS_FILE, []);
+let meta = readJSON(META_FILE, { lastActivityAt: Date.now() });
+
+// Prune chats older than 24 hours
+function pruneOldChats() {
+  const now = Date.now();
+  const beforeLen = chats.length;
+  chats = chats.filter(c => c && c.timestamp && (now - c.timestamp <= TWENTY_FOUR_HOURS_MS));
+  if (chats.length !== beforeLen) {
+    writeJSON(CHATS_FILE, chats);
+  }
+}
+
+// Check 3-hour inactivity auto-reset & 61-minute -> 30-minute auto-adjustment
+function checkAutoRules() {
+  const now = Date.now();
+  let hasAnyRecord = false;
+  let recordsChanged = false;
+
+  for (const srv of Object.keys(records)) {
+    const srvRecs = records[srv];
+    if (!srvRecs) continue;
+    for (const bossId of Object.keys(srvRecs)) {
+      const rec = srvRecs[bossId];
+      if (!rec || !rec.killedAt) continue;
+      hasAnyRecord = true;
+
+      // Rule 3: If channel exceeds 61 minutes since killedAt, automatically set to remaining 30 minutes
+      if (!rec.autoAdjusted30m && (now - rec.killedAt >= SIXTY_ONE_MINS_MS)) {
+        const newKilledAt = rec.killedAt + SIXTY_ONE_MINS_MS;
+        const newRespawnAt = newKilledAt + THIRTY_MINS_MS;
+        rec.killedAt = newKilledAt;
+        rec.respawnMinutes = 30;
+        rec.respawnAt = newRespawnAt;
+        rec.autoAdjusted30m = true;
+        rec.note = rec.note ? `${rec.note} (超過61分自動改剩30分)` : '超過61分自動改為剩餘30分';
+        recordsChanged = true;
+
+        const logEntry = {
+          id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
+          type: 'AUTO_30M',
+          serverId: srv,
+          bossId,
+          bossName: rec.bossName,
+          killedAt: newKilledAt,
+          respawnAt: newRespawnAt,
+          respawnMinutes: 30,
+          reporter: '系統自動(61分轉30分)',
+          timestamp: now
+        };
+        logs.unshift(logEntry);
+        if (logs.length > 200) logs.pop();
+
+        broadcast({
+          type: 'RECORD_UPDATED',
+          record: rec,
+          log: logEntry,
+          isAutoAdjust: true
+        });
+      }
+    }
+  }
+
+  // Rule 1: If no manual data modification for 3 hours, automatically reset all channels
+  if (hasAnyRecord && meta.lastActivityAt && (now - meta.lastActivityAt >= THREE_HOURS_MS)) {
+    records = {};
+    meta.lastActivityAt = now;
+    writeJSON(RECORDS_FILE, records);
+    writeJSON(META_FILE, meta);
+
+    const logEntry = {
+      id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
+      type: 'AUTO_RESET_3H',
+      serverId: 'ALL',
+      bossId: 'ALL',
+      bossName: '全頻道',
+      reporter: '系統自動(閒置3小時重置)',
+      timestamp: now
+    };
+    logs.unshift(logEntry);
+    if (logs.length > 200) logs.pop();
+    writeJSON(LOGS_FILE, logs);
+
+    broadcast({
+      type: 'ALL_RECORDS_RESET',
+      lastActivityAt: meta.lastActivityAt,
+      log: logEntry
+    });
+    return;
+  }
+
+  if (recordsChanged) {
+    writeJSON(RECORDS_FILE, records);
+    writeJSON(LOGS_FILE, logs);
+  }
+}
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -116,25 +226,29 @@ app.get('/api/network-info', (req, res) => {
 
 // API: Get initial state (protected)
 app.get('/api/state', checkAuth, (req, res) => {
+  pruneOldChats();
+  checkAutoRules();
   res.json({
     success: true,
     config,
     records,
-    logs: logs.slice(0, 100)
+    logs: logs.slice(0, 100),
+    chats,
+    lastActivityAt: meta.lastActivityAt || Date.now()
   });
 });
 
 // API: Record boss kill time (protected)
 app.post('/api/record', checkAuth, (req, res) => {
-  const { serverId, bossId, killedAt, respawnMinutes, note } = req.body;
-  const reporter = req.currentUser;
+  const { serverId, bossId, killedAt, respawnMinutes, note, isAutoAdjust } = req.body;
+  const reporter = isAutoAdjust ? '系統自動(61分轉30分)' : req.currentUser;
 
   if (!serverId || !bossId) {
     return res.status(400).json({ success: false, error: '缺少 serverId 或 bossId' });
   }
 
   const kTime = killedAt ? Number(killedAt) : Date.now();
-  const rMinutes = Number(respawnMinutes) > 0 ? Number(respawnMinutes) : 60;
+  const rMinutes = Number(respawnMinutes) > 0 ? Number(respawnMinutes) : 45;
   const respawnAt = kTime + rMinutes * 60 * 1000;
 
   if (!records[serverId]) {
@@ -152,16 +266,21 @@ app.post('/api/record', checkAuth, (req, res) => {
     respawnAt,
     reporter,
     note: note || '',
+    autoAdjusted30m: Boolean(isAutoAdjust),
     updatedAt: Date.now()
   };
 
   records[serverId][bossId] = recordEntry;
   writeJSON(RECORDS_FILE, records);
 
-  // Add to logs
+  if (!isAutoAdjust) {
+    meta.lastActivityAt = Date.now();
+    writeJSON(META_FILE, meta);
+  }
+
   const logEntry = {
     id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-    type: 'KILL',
+    type: isAutoAdjust ? 'AUTO_30M' : 'KILL',
     serverId,
     bossId,
     bossName: bossDef.name,
@@ -177,14 +296,15 @@ app.post('/api/record', checkAuth, (req, res) => {
   if (logs.length > 200) logs.pop();
   writeJSON(LOGS_FILE, logs);
 
-  // Broadcast to all WebSocket clients
   broadcast({
     type: 'RECORD_UPDATED',
     record: recordEntry,
-    log: logEntry
+    log: logEntry,
+    lastActivityAt: meta.lastActivityAt,
+    isAutoAdjust: Boolean(isAutoAdjust)
   });
 
-  res.json({ success: true, record: recordEntry });
+  res.json({ success: true, record: recordEntry, lastActivityAt: meta.lastActivityAt });
 });
 
 // API: Clear/Reset a boss record (protected)
@@ -196,6 +316,9 @@ app.post('/api/record/clear', checkAuth, (req, res) => {
     const bossDef = config.bosses.find(b => b.id === bossId) || { name: bossId };
     delete records[serverId][bossId];
     writeJSON(RECORDS_FILE, records);
+
+    meta.lastActivityAt = Date.now();
+    writeJSON(META_FILE, meta);
 
     const logEntry = {
       id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
@@ -216,11 +339,72 @@ app.post('/api/record/clear', checkAuth, (req, res) => {
       bossId,
       bossName: bossDef.name,
       reporter,
+      lastActivityAt: meta.lastActivityAt,
       log: logEntry
     });
   }
 
-  res.json({ success: true });
+  res.json({ success: true, lastActivityAt: meta.lastActivityAt });
+});
+
+// API: Reset ALL channels (protected)
+app.post('/api/record/reset-all', checkAuth, (req, res) => {
+  const { isAuto } = req.body || {};
+  records = {};
+  meta.lastActivityAt = Date.now();
+  writeJSON(RECORDS_FILE, records);
+  writeJSON(META_FILE, meta);
+
+  const logEntry = {
+    id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+    type: isAuto ? 'AUTO_RESET_3H' : 'CLEAR',
+    serverId: 'ALL',
+    bossId: 'ALL',
+    bossName: '全頻道',
+    reporter: isAuto ? '系統自動(閒置3小時重置)' : req.currentUser,
+    timestamp: Date.now()
+  };
+  logs.unshift(logEntry);
+  if (logs.length > 200) logs.pop();
+  writeJSON(LOGS_FILE, logs);
+
+  broadcast({
+    type: 'ALL_RECORDS_RESET',
+    lastActivityAt: meta.lastActivityAt,
+    log: logEntry
+  });
+
+  res.json({ success: true, lastActivityAt: meta.lastActivityAt });
+});
+
+// API: Send Chat Message (protected, kept for 24 hours)
+app.post('/api/chat', checkAuth, (req, res) => {
+  const { text } = req.body;
+  if (!text || !String(text).trim()) {
+    return res.status(400).json({ success: false, error: '訊息不能為空' });
+  }
+
+  pruneOldChats();
+
+  const chatMsg = {
+    id: `chat_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+    sender: req.currentUser,
+    text: String(text).trim().slice(0, 500),
+    timestamp: Date.now()
+  };
+
+  chats.push(chatMsg);
+  if (chats.length > 300) {
+    chats = chats.slice(-300);
+  }
+  writeJSON(CHATS_FILE, chats);
+
+  broadcast({
+    type: 'CHAT_MESSAGE',
+    chat: chatMsg
+  });
+
+  res.json({ success: true, chat: chatMsg });
 });
 
 // API: Manage boss definitions (add/edit/delete) (protected)
@@ -311,8 +495,14 @@ wss.on('connection', (ws) => {
   });
 });
 
+// Periodic server-side check for 3h reset, 61m->30m adjustment, and 24h chat pruning
+const rulesInterval = setInterval(() => {
+  pruneOldChats();
+  checkAutoRules();
+}, 5000);
+
 // Ping interval to keep connections alive
-const interval = setInterval(() => {
+const wsPingInterval = setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
@@ -321,7 +511,8 @@ const interval = setInterval(() => {
 }, 30000);
 
 wss.on('close', () => {
-  clearInterval(interval);
+  clearInterval(rulesInterval);
+  clearInterval(wsPingInterval);
 });
 
 server.listen(PORT, '0.0.0.0', () => {

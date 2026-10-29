@@ -1,8 +1,13 @@
-// Main Application Logic for Boss Respawn Tracker (Single-Boss Focused Mode)
+// Main Application Logic for Boss Respawn Tracker (Single-Boss Focused Mode + 3H Reset + 61M->30M + 24H Chat)
 (function () {
   'use strict';
 
   const isGitHubPages = window.location.hostname.endsWith('github.io');
+  const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+  const SIXTY_ONE_MINS_MS = 61 * 60 * 1000;
+  const THIRTY_MINS_MS = 30 * 60 * 1000;
+
   const DEFAULT_BOSSES = [
     {
       id: 'boss_mushmom',
@@ -28,10 +33,12 @@
     config: {
       authNames: ['啞啞', '森森'],
       servers: Array.from({ length: 60 }, (_, i) => `S${i + 1}`),
-      bosses: DEFAULT_BOSSES
+      bosses: [...DEFAULT_BOSSES]
     },
     records: {},
     logs: [],
+    chats: [],
+    lastActivityAt: parseInt(localStorage.getItem('boss_last_activity') || String(Date.now()), 10),
     activeBossId: localStorage.getItem('boss_active_id') || 'boss_mushmom',
     activeServer: localStorage.getItem('boss_active_server') || 'S1',
     currentView: 'server', // 'server' | 'radar' | 'history'
@@ -48,6 +55,7 @@
     connStatus: document.getElementById('connStatus'),
     connDot: document.getElementById('connDot'),
     connText: document.getElementById('connText'),
+    lblInactivityTimer: document.getElementById('lblInactivityTimer'),
     btnToggleSound: document.getElementById('btnToggleSound'),
     btnToggleVoice: document.getElementById('btnToggleVoice'),
     selectAlertMinutes: document.getElementById('selectAlertMinutes'),
@@ -78,11 +86,17 @@
     serverGrid: document.getElementById('serverGrid'),
     serverRangeTabs: document.getElementById('serverRangeTabs'),
 
-    // Step 3: Single Boss Card & Active Server Summary
+    // Step 3: Single Boss Card, Active Server Summary & Chat Room
     singleBossContainer: document.getElementById('singleBossContainer'),
     lblSummaryBossName: document.getElementById('lblSummaryBossName'),
     lblActiveBossServerCount: document.getElementById('lblActiveBossServerCount'),
+    btnResetAllChannels: document.getElementById('btnResetAllChannels'),
     singleBossServerList: document.getElementById('singleBossServerList'),
+
+    chatMessagesBox: document.getElementById('chatMessagesBox'),
+    chatQuickPhrases: document.getElementById('chatQuickPhrases'),
+    inputChatMessage: document.getElementById('inputChatMessage'),
+    btnSendChat: document.getElementById('btnSendChat'),
 
     radarTableBody: document.getElementById('radarTableBody'),
     historyTableBody: document.getElementById('historyTableBody'),
@@ -116,7 +130,9 @@
 
   // Get currently selected Boss object
   function getActiveBoss() {
-    if (!state.config.bosses || state.config.bosses.length === 0) return null;
+    if (!state.config.bosses || state.config.bosses.length === 0) {
+      state.config.bosses = [...DEFAULT_BOSSES];
+    }
     let found = state.config.bosses.find(b => b.id === state.activeBossId);
     if (!found) {
       found = state.config.bosses[0];
@@ -124,6 +140,39 @@
       localStorage.setItem('boss_active_id', found.id);
     }
     return found;
+  }
+
+  // Count total active records across all servers and bosses
+  function hasAnyActiveRecords() {
+    for (const srv of Object.keys(state.records)) {
+      const srvRecs = state.records[srv];
+      if (srvRecs && Object.keys(srvRecs).length > 0) return true;
+    }
+    return false;
+  }
+
+  // Persist state to localStorage (ensures data survives page reloads & code updates)
+  function saveLocalCloudCache() {
+    try {
+      localStorage.setItem('boss_cloud_config', JSON.stringify(state.config));
+      localStorage.setItem('boss_cloud_records', JSON.stringify(state.records));
+      localStorage.setItem('boss_cloud_logs', JSON.stringify(state.logs.slice(0, 200)));
+      localStorage.setItem('boss_cloud_chats', JSON.stringify(state.chats.slice(-300)));
+      localStorage.setItem('boss_last_activity', String(state.lastActivityAt));
+    } catch (e) {}
+  }
+
+  // Merge bosses non-destructively so code updates never wipe user-added bosses
+  function mergeBossesNonDestructive(existingBosses, incomingBosses) {
+    const map = new Map();
+    DEFAULT_BOSSES.forEach(b => map.set(b.id, { ...b }));
+    (existingBosses || []).forEach(b => {
+      if (b && b.id) map.set(b.id, { ...b });
+    });
+    (incomingBosses || []).forEach(b => {
+      if (b && b.id) map.set(b.id, { ...b });
+    });
+    return Array.from(map.values());
   }
 
   // Setup LiveSocket
@@ -144,15 +193,6 @@
     }
   });
 
-  function saveLocalCloudCache() {
-    if (!isGitHubPages) return;
-    try {
-      localStorage.setItem('boss_cloud_config', JSON.stringify(state.config));
-      localStorage.setItem('boss_cloud_records', JSON.stringify(state.records));
-      localStorage.setItem('boss_cloud_logs', JSON.stringify(state.logs));
-    } catch (e) {}
-  }
-
   // Handle incoming real-time socket events
   function handleSocketMessage(msg) {
     if (msg.type === 'RECORD_UPDATED') {
@@ -160,13 +200,22 @@
       if (!state.records[rec.serverId]) state.records[rec.serverId] = {};
       state.records[rec.serverId][rec.bossId] = rec;
 
+      if (!msg.isAutoAdjust) {
+        state.lastActivityAt = msg.lastActivityAt || Date.now();
+      }
+
       if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
         state.logs.unshift(msg.log);
         if (state.logs.length > 200) state.logs.pop();
       }
       saveLocalCloudCache();
 
-      showToast(`📢 ${rec.reporter} 更新了 [${rec.serverId}] ${rec.bossName} 的打死時間！`, 'info');
+      if (msg.isAutoAdjust) {
+        showToast(`⚡ [${rec.serverId}] ${rec.bossName} 已超過 61 分鐘，自動改為剩餘 30 分鐘！`, 'warn');
+      } else {
+        showToast(`📢 ${rec.reporter} 更新了 [${rec.serverId}] ${rec.bossName} 的打死時間！`, 'info');
+      }
+
       renderTopBossTabs();
       renderServerGridBadges();
       if (state.currentView === 'server') {
@@ -179,6 +228,7 @@
       if (state.records[msg.serverId]) {
         delete state.records[msg.serverId][msg.bossId];
       }
+      state.lastActivityAt = msg.lastActivityAt || Date.now();
       if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
         state.logs.unshift(msg.log);
       }
@@ -195,6 +245,34 @@
       }
       if (state.currentView === 'radar') renderRadarView();
       if (state.currentView === 'history') renderHistoryView();
+    } else if (msg.type === 'ALL_RECORDS_RESET') {
+      state.records = {};
+      state.lastActivityAt = msg.lastActivityAt || Date.now();
+      if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
+        state.logs.unshift(msg.log);
+      }
+      saveLocalCloudCache();
+
+      showToast('⏰ 所有頻道紀錄已重置清空！', 'warn');
+      renderTopBossTabs();
+      renderServerGridBadges();
+      if (state.currentView === 'server') {
+        renderSingleBossView();
+        renderSingleBossServerList();
+      }
+      if (state.currentView === 'radar') renderRadarView();
+      if (state.currentView === 'history') renderHistoryView();
+    } else if (msg.type === 'CHAT_MESSAGE' && msg.chat) {
+      pruneOldChatsInState();
+      if (!state.chats.some(c => c.id === msg.chat.id)) {
+        state.chats.push(msg.chat);
+        saveLocalCloudCache();
+        renderChatMessages();
+        if (msg.chat.sender !== state.currentUser && window.soundEngine) {
+          window.soundEngine.playChime('normal');
+          showToast(`💬 ${msg.chat.sender}：${msg.chat.text}`, 'info');
+        }
+      }
     } else if (msg.type === 'CONFIG_UPDATED') {
       state.config = msg.config;
       saveLocalCloudCache();
@@ -245,14 +323,21 @@
     if (endpoint === '/api/state') {
       try {
         const savedCfg = localStorage.getItem('boss_cloud_config');
-        if (savedCfg) state.config = JSON.parse(savedCfg);
+        if (savedCfg) {
+          const parsedCfg = JSON.parse(savedCfg);
+          state.config.bosses = mergeBossesNonDestructive(state.config.bosses, parsedCfg.bosses);
+        }
         const savedRec = localStorage.getItem('boss_cloud_records');
         if (savedRec) state.records = JSON.parse(savedRec);
         const savedLogs = localStorage.getItem('boss_cloud_logs');
         if (savedLogs) state.logs = JSON.parse(savedLogs);
+        const savedChats = localStorage.getItem('boss_cloud_chats');
+        if (savedChats) state.chats = JSON.parse(savedChats);
+        const savedAct = localStorage.getItem('boss_last_activity');
+        if (savedAct) state.lastActivityAt = parseInt(savedAct, 10) || Date.now();
       } catch (e) {}
 
-      // Fetch recent events from ntfy.sh cloud history
+      // Fetch recent events from ntfy.sh cloud history (24h window) without wiping local data
       try {
         const res = await fetch(`https://ntfy.sh/${liveSocket.cloudTopic}/json?poll=1&since=24h`);
         const text = await res.text();
@@ -265,21 +350,43 @@
               if (msg.type === 'RECORD_UPDATED' && msg.record) {
                 const r = msg.record;
                 if (!state.records[r.serverId]) state.records[r.serverId] = {};
-                state.records[r.serverId][r.bossId] = r;
+                const existing = state.records[r.serverId][r.bossId];
+                if (!existing || (r.updatedAt || 0) >= (existing.updatedAt || 0)) {
+                  state.records[r.serverId][r.bossId] = r;
+                }
+                if (!msg.isAutoAdjust && msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+                  state.lastActivityAt = msg.lastActivityAt;
+                }
                 if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
                   state.logs.unshift(msg.log);
                 }
               } else if (msg.type === 'RECORD_CLEARED') {
                 if (state.records[msg.serverId]) delete state.records[msg.serverId][msg.bossId];
+                if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+                  state.lastActivityAt = msg.lastActivityAt;
+                }
                 if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
                   state.logs.unshift(msg.log);
                 }
+              } else if (msg.type === 'ALL_RECORDS_RESET') {
+                state.records = {};
+                if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+                  state.lastActivityAt = msg.lastActivityAt;
+                }
+                if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
+                  state.logs.unshift(msg.log);
+                }
+              } else if (msg.type === 'CHAT_MESSAGE' && msg.chat) {
+                if (!state.chats.some(c => c.id === msg.chat.id)) {
+                  state.chats.push(msg.chat);
+                }
               } else if (msg.type === 'CONFIG_UPDATED' && msg.config) {
-                state.config = msg.config;
+                state.config.bosses = mergeBossesNonDestructive(state.config.bosses, msg.config.bosses);
               }
             }
           } catch (e) {}
         });
+        pruneOldChatsInState();
         saveLocalCloudCache();
       } catch (e) {}
 
@@ -287,16 +394,19 @@
         success: true,
         config: state.config,
         records: state.records,
-        logs: state.logs.slice(0, 100)
+        logs: state.logs.slice(0, 100),
+        chats: state.chats,
+        lastActivityAt: state.lastActivityAt
       };
     }
 
     if (endpoint === '/api/record') {
-      const { serverId, bossId, killedAt, respawnMinutes, note } = body;
+      const { serverId, bossId, killedAt, respawnMinutes, note, isAutoAdjust } = body;
       const kTime = killedAt ? Number(killedAt) : Date.now();
       const rMinutes = Number(respawnMinutes) > 0 ? Number(respawnMinutes) : 45;
       const respawnAt = kTime + rMinutes * 60 * 1000;
       const bossDef = state.config.bosses.find(b => b.id === bossId) || { name: bossId };
+      const reporter = isAutoAdjust ? '系統自動(61分轉30分)' : state.currentUser;
 
       const recordEntry = {
         serverId,
@@ -305,24 +415,29 @@
         killedAt: kTime,
         respawnMinutes: rMinutes,
         respawnAt,
-        reporter: state.currentUser,
+        reporter,
         note: note || '',
+        autoAdjusted30m: Boolean(isAutoAdjust),
         updatedAt: Date.now()
       };
 
       if (!state.records[serverId]) state.records[serverId] = {};
       state.records[serverId][bossId] = recordEntry;
 
+      if (!isAutoAdjust) {
+        state.lastActivityAt = Date.now();
+      }
+
       const logEntry = {
         id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-        type: 'KILL',
+        type: isAutoAdjust ? 'AUTO_30M' : 'KILL',
         serverId,
         bossId,
         bossName: bossDef.name,
         killedAt: kTime,
         respawnAt,
         respawnMinutes: rMinutes,
-        reporter: state.currentUser,
+        reporter,
         note: note || '',
         timestamp: Date.now()
       };
@@ -333,16 +448,19 @@
       liveSocket.broadcastCloud({
         type: 'RECORD_UPDATED',
         record: recordEntry,
-        log: logEntry
+        log: logEntry,
+        lastActivityAt: state.lastActivityAt,
+        isAutoAdjust: Boolean(isAutoAdjust)
       });
 
-      return { success: true, record: recordEntry };
+      return { success: true, record: recordEntry, lastActivityAt: state.lastActivityAt };
     }
 
     if (endpoint === '/api/record/clear') {
       const { serverId, bossId } = body;
       const bossDef = state.config.bosses.find(b => b.id === bossId) || { name: bossId };
       if (state.records[serverId]) delete state.records[serverId][bossId];
+      state.lastActivityAt = Date.now();
 
       const logEntry = {
         id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
@@ -362,10 +480,57 @@
         bossId,
         bossName: bossDef.name,
         reporter: state.currentUser,
+        lastActivityAt: state.lastActivityAt,
         log: logEntry
       });
 
-      return { success: true };
+      return { success: true, lastActivityAt: state.lastActivityAt };
+    }
+
+    if (endpoint === '/api/record/reset-all') {
+      const { isAuto } = body;
+      state.records = {};
+      state.lastActivityAt = Date.now();
+
+      const logEntry = {
+        id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        type: isAuto ? 'AUTO_RESET_3H' : 'CLEAR',
+        serverId: 'ALL',
+        bossId: 'ALL',
+        bossName: '全頻道',
+        reporter: isAuto ? '系統自動(閒置3小時重置)' : state.currentUser,
+        timestamp: Date.now()
+      };
+      state.logs.unshift(logEntry);
+      saveLocalCloudCache();
+
+      liveSocket.broadcastCloud({
+        type: 'ALL_RECORDS_RESET',
+        lastActivityAt: state.lastActivityAt,
+        log: logEntry
+      });
+
+      return { success: true, lastActivityAt: state.lastActivityAt };
+    }
+
+    if (endpoint === '/api/chat') {
+      const text = String(body.text || '').trim().slice(0, 500);
+      pruneOldChatsInState();
+      const chatMsg = {
+        id: `chat_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        sender: state.currentUser,
+        text,
+        timestamp: Date.now()
+      };
+      state.chats.push(chatMsg);
+      saveLocalCloudCache();
+
+      liveSocket.broadcastCloud({
+        type: 'CHAT_MESSAGE',
+        chat: chatMsg
+      });
+
+      return { success: true, chat: chatMsg };
     }
 
     if (endpoint === '/api/bosses') {
@@ -486,7 +651,7 @@
     }
   }
 
-  // Load state from backend
+  // Load state from backend / cloud
   async function initAppState() {
     try {
       const data = await apiFetch('/api/state');
@@ -494,6 +659,12 @@
         state.config = data.config;
         state.records = data.records || {};
         state.logs = data.logs || [];
+        state.chats = data.chats || [];
+        if (data.lastActivityAt) {
+          state.lastActivityAt = data.lastActivityAt;
+        }
+        pruneOldChatsInState();
+        saveLocalCloudCache();
 
         // Pre-seed alertedCache for bosses that already spawned > 1 minute ago
         const now = Date.now();
@@ -512,6 +683,7 @@
         renderTopBossTabs();
         renderServerButtons();
         selectBoss(state.activeBossId);
+        renderChatMessages();
         startCountdownTicker();
 
         if ('Notification' in window && Notification.permission === 'default') {
@@ -523,13 +695,84 @@
     }
   }
 
-  // STEP 1: Render Top Boss Tabs (蘑菇王, 殭屍姑姑王, etc.)
+  // 24-Hour Chat Room Helpers
+  function pruneOldChatsInState() {
+    const now = Date.now();
+    state.chats = (state.chats || []).filter(c => c && c.timestamp && (now - c.timestamp <= TWENTY_FOUR_HOURS_MS));
+    state.chats.sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  function renderChatMessages() {
+    if (!el.chatMessagesBox) return;
+    pruneOldChatsInState();
+    el.chatMessagesBox.innerHTML = '';
+
+    if (state.chats.length === 0) {
+      el.chatMessagesBox.innerHTML = `
+        <div class="empty-state" style="padding: 40px 10px;">
+          <div style="font-size: 24px; margin-bottom: 6px;">💬</div>
+          <div style="font-size: 0.85rem;">尚無聊天訊息（訊息將自動保留 24 小時）</div>
+        </div>
+      `;
+      return;
+    }
+
+    state.chats.forEach(msg => {
+      const isSelf = msg.sender === state.currentUser;
+      const item = document.createElement('div');
+      item.className = `chat-msg-item ${isSelf ? 'self' : 'other'}`;
+      item.innerHTML = `
+        <div class="chat-msg-header">
+          <span class="chat-msg-sender">${escapeHtml(msg.sender)}</span>
+          <span>${formatTime(new Date(msg.timestamp))}</span>
+        </div>
+        <div>${escapeHtml(msg.text)}</div>
+      `;
+      el.chatMessagesBox.appendChild(item);
+    });
+
+    el.chatMessagesBox.scrollTop = el.chatMessagesBox.scrollHeight;
+  }
+
+  async function sendChatMessage(customText) {
+    const raw = customText !== undefined ? customText : el.inputChatMessage.value;
+    const text = String(raw || '').trim();
+    if (!text) return;
+
+    if (customText === undefined) {
+      el.inputChatMessage.value = '';
+    }
+
+    try {
+      const res = await apiFetch('/api/chat', {
+        method: 'POST',
+        body: JSON.stringify({ text })
+      });
+      if (res.success && res.chat) {
+        if (!state.chats.some(c => c.id === res.chat.id)) {
+          state.chats.push(res.chat);
+        }
+        renderChatMessages();
+      }
+    } catch (e) {
+      showToast('發送訊息失敗：' + e.message, 'error');
+    }
+  }
+
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // STEP 1: Render Top Boss Tabs
   function renderTopBossTabs() {
     el.topBossTabs.innerHTML = '';
     const activeBoss = getActiveBoss();
 
     state.config.bosses.forEach(boss => {
-      // Count how many servers have records for this boss
       let count = 0;
       state.config.servers.forEach(srv => {
         if (state.records[srv] && state.records[srv][boss.id]) count++;
@@ -618,7 +861,6 @@
     const activeBoss = getActiveBoss();
     let totalRadarCount = 0;
 
-    // Count total radar across all bosses for the top tab badge
     state.config.servers.forEach(srv => {
       const srvRecs = state.records[srv] || {};
       Object.values(srvRecs).forEach(r => {
@@ -629,7 +871,6 @@
     });
     el.lblRadarCount.textContent = totalRadarCount;
 
-    // Update S1~S60 buttons specifically for the active Boss
     state.config.servers.forEach(srv => {
       const srvRecs = state.records[srv] || {};
       const rec = activeBoss ? srvRecs[activeBoss.id] : null;
@@ -698,6 +939,7 @@
 
       const killedTimeStr = formatTime(new Date(rec.killedAt));
       const respawnTimeStr = formatTime(new Date(rec.respawnAt));
+      const auto30Tag = rec.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 超過61分已自動改為剩餘30分</span>' : '';
 
       if (diffMs <= 0) {
         statusClass = 'status-alive';
@@ -722,15 +964,15 @@
 
       detailsHtml = `
         <div class="detail-row">
-          <span>打死時間：</span>
-          <span class="detail-highlight">${killedTimeStr} (回報人: ${rec.reporter || '未知'})</span>
+          <span>基準時間：</span>
+          <span class="detail-highlight">${killedTimeStr} (${rec.reporter || '未知'}) ${auto30Tag}</span>
         </div>
         <div class="detail-row">
           <span>預計復活時間：</span>
           <span class="detail-highlight" style="color: var(--accent-cyan); font-weight: 700;">${respawnTimeStr}</span>
         </div>
         <div class="detail-row">
-          <span>設定復活間隔：</span>
+          <span>目前設定間隔：</span>
           <span class="detail-highlight">${formatMinutes(rec.respawnMinutes)}</span>
         </div>
         ${rec.note ? `<div class="detail-row"><span>備註：</span><span class="detail-highlight">${rec.note}</span></div>` : ''}
@@ -792,7 +1034,7 @@
         <!-- Quick 1-Click Kill Button -->
         <div style="display: flex; gap: 10px; margin-bottom: 18px;">
           <button type="button" class="btn-record-kill" id="btnSingleQuickKill" style="flex: 1; padding: 12px; font-size: 1.05rem;">
-            ⚡ 剛剛打死 [${state.activeServer}] ${boss.name}（立即倒數 ${formatMinutes(currentRespawnMins)}）
+            ⚡ 剛剛打死 [${state.activeServer}] ${boss.name}（立即倒數 ${formatMinutes(boss.respawnMinutes)}）
           </button>
           ${rec ? `<button type="button" class="btn btn-danger" id="btnSingleClearKill" title="清除此服紀錄">🔄 清除紀錄</button>` : ''}
         </div>
@@ -807,16 +1049,16 @@
           <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label">選擇或輸入復活時間 (分鐘)：</label>
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-              <input type="number" id="singleInputRespawnMins" class="form-input" style="width: 100px; padding: 6px 10px;" min="1" max="10080" value="${currentRespawnMins}">
+              <input type="number" id="singleInputRespawnMins" class="form-input" style="width: 100px; padding: 6px 10px;" min="1" max="10080" value="${boss.respawnMinutes}">
               <span style="font-size: 0.85rem; color: var(--text-secondary);">分鐘</span>
               <div class="qr-preset-group" id="singleRespawnPresets">
-                <button type="button" class="quick-tag-btn ${currentRespawnMins === 30 ? 'active' : ''}" data-preset-min="30">30分鐘</button>
-                <button type="button" class="quick-tag-btn ${currentRespawnMins === 45 ? 'active' : ''}" data-preset-min="45">45分鐘</button>
-                <button type="button" class="quick-tag-btn ${currentRespawnMins === 60 ? 'active' : ''}" data-preset-min="60">1小時</button>
-                <button type="button" class="quick-tag-btn ${currentRespawnMins === 90 ? 'active' : ''}" data-preset-min="90">1.5小時</button>
-                <button type="button" class="quick-tag-btn ${currentRespawnMins === 120 ? 'active' : ''}" data-preset-min="120">2小時</button>
-                <button type="button" class="quick-tag-btn ${currentRespawnMins === 180 ? 'active' : ''}" data-preset-min="180">3小時</button>
-                <button type="button" class="quick-tag-btn ${currentRespawnMins === 240 ? 'active' : ''}" data-preset-min="240">4小時</button>
+                <button type="button" class="quick-tag-btn ${boss.respawnMinutes === 30 ? 'active' : ''}" data-preset-min="30">30分鐘</button>
+                <button type="button" class="quick-tag-btn ${boss.respawnMinutes === 45 ? 'active' : ''}" data-preset-min="45">45分鐘</button>
+                <button type="button" class="quick-tag-btn ${boss.respawnMinutes === 60 ? 'active' : ''}" data-preset-min="60">1小時</button>
+                <button type="button" class="quick-tag-btn ${boss.respawnMinutes === 90 ? 'active' : ''}" data-preset-min="90">1.5小時</button>
+                <button type="button" class="quick-tag-btn ${boss.respawnMinutes === 120 ? 'active' : ''}" data-preset-min="120">2小時</button>
+                <button type="button" class="quick-tag-btn ${boss.respawnMinutes === 180 ? 'active' : ''}" data-preset-min="180">3小時</button>
+                <button type="button" class="quick-tag-btn ${boss.respawnMinutes === 240 ? 'active' : ''}" data-preset-min="240">4小時</button>
               </div>
             </div>
           </div>
@@ -836,7 +1078,7 @@
 
           <!-- Note & Submit -->
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-            <input type="text" id="singleInputNote" class="form-input" placeholder="備註 (選填，例如掉落物)" value="${rec ? (rec.note || '') : ''}" style="flex: 1; min-width: 160px; padding: 8px 12px;">
+            <input type="text" id="singleInputNote" class="form-input" placeholder="備註 (選填，例如掉落物)" value="" style="flex: 1; min-width: 160px; padding: 8px 12px;">
             <button type="button" class="btn btn-primary" id="btnSingleSubmitCustom" style="padding: 9px 18px; font-weight: 700;">
               ✅ 記錄時間並開始倒數
             </button>
@@ -845,14 +1087,12 @@
       </div>
     `;
 
-    // Bind events inside the Single Boss Card
     const inputRespawnMins = card.querySelector('#singleInputRespawnMins');
     const inputKilledAt = card.querySelector('#singleInputKilledAt');
     const inputNote = card.querySelector('#singleInputNote');
 
     card.querySelector('#btnSingleQuickKill').addEventListener('click', () => {
-      const mins = parseInt(inputRespawnMins.value, 10) || currentRespawnMins;
-      saveBossRecord(state.activeServer, boss.id, Date.now(), mins, inputNote.value.trim());
+      saveBossRecord(state.activeServer, boss.id, Date.now(), boss.respawnMinutes, inputNote.value.trim(), false);
     });
 
     const btnClear = card.querySelector('#btnSingleClearKill');
@@ -885,7 +1125,7 @@
         alert('請輸入大於 0 的復活時間分鐘數！');
         return;
       }
-      saveBossRecord(state.activeServer, boss.id, killedAt, mins, inputNote.value.trim());
+      saveBossRecord(state.activeServer, boss.id, killedAt, mins, inputNote.value.trim(), false);
     });
 
     el.singleBossContainer.appendChild(card);
@@ -958,14 +1198,13 @@
     });
 
     activeItems.sort((a, b) => a.diffMs - b.diffMs);
-    el.lblActiveBossServerCount.textContent = `共 ${activeItems.length} 個伺服器有紀錄`;
+    el.lblActiveBossServerCount.textContent = `${activeItems.length} 個頻道`;
 
     if (activeItems.length === 0) {
       el.singleBossServerList.innerHTML = `
-        <div class="empty-state" style="padding: 36px 12px;">
-          <div style="font-size: 28px; margin-bottom: 8px;">🍄</div>
-          <div>目前【${boss.name}】在 S1~S60 尚無倒數紀錄</div>
-          <div style="font-size: 0.8rem; margin-top: 4px;">點選上方 S1~S60 並記錄打死時間後將自動列於此處</div>
+        <div class="empty-state" style="padding: 28px 12px;">
+          <div style="font-size: 24px; margin-bottom: 6px;">🍄</div>
+          <div>目前【${boss.name}】尚無倒數紀錄</div>
         </div>
       `;
       return;
@@ -985,16 +1224,18 @@
         ? `已重生 +${formatDuration(sec)}`
         : formatDuration(sec);
 
+      const auto30Badge = item.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 61分轉剩30分</span>' : '';
+
       row.className = `srv-summary-row ${item.serverId === state.activeServer ? 'active-srv' : ''}`;
       row.innerHTML = `
         <div style="display: flex; align-items: center; gap: 10px;">
           <span class="radar-server-tag" style="min-width: 36px;">${item.serverId}</span>
           <div>
-            <div style="font-family: var(--font-mono); font-weight: 800; font-size: 1.05rem; color: ${timerColor};">
-              ${timerStr}
+            <div style="font-family: var(--font-mono); font-weight: 800; font-size: 1rem; color: ${timerColor};">
+              ${timerStr} ${auto30Badge}
             </div>
-            <div style="font-size: 0.76rem; color: var(--text-secondary);">
-              預計 ${formatTime(new Date(item.respawnAt))} 復活 · 打死 ${formatTime(new Date(item.killedAt))} (${item.reporter || '未知'})
+            <div style="font-size: 0.74rem; color: var(--text-secondary);">
+              預計 ${formatTime(new Date(item.respawnAt))} 復活 · 記錄 ${formatTime(new Date(item.killedAt))}
             </div>
           </div>
         </div>
@@ -1018,7 +1259,7 @@
   }
 
   // Save Boss Kill Record
-  async function saveBossRecord(serverId, bossId, killedAt, respawnMinutes, note) {
+  async function saveBossRecord(serverId, bossId, killedAt, respawnMinutes, note, isAutoAdjust = false) {
     try {
       const res = await apiFetch('/api/record', {
         method: 'POST',
@@ -1027,21 +1268,28 @@
           bossId,
           killedAt,
           respawnMinutes,
-          note
+          note,
+          isAutoAdjust
         })
       });
 
       if (res.success) {
-        showToast(`✅ 已記錄 [${serverId}] ${res.record.bossName} 打死時間，開始倒數 ${formatMinutes(respawnMinutes)}！`, 'success');
+        if (!isAutoAdjust) {
+          showToast(`✅ 已記錄 [${serverId}] ${res.record.bossName} 打死時間，開始倒數 ${formatMinutes(respawnMinutes)}！`, 'success');
+        } else {
+          showToast(`⚡ [${serverId}] ${res.record.bossName} 超過 61 分鐘，已自動調整為剩餘 30 分鐘！`, 'warn');
+        }
         if (!state.records[serverId]) state.records[serverId] = {};
         state.records[serverId][bossId] = res.record;
+        if (res.lastActivityAt) state.lastActivityAt = res.lastActivityAt;
+        saveLocalCloudCache();
         renderTopBossTabs();
         renderServerGridBadges();
         renderSingleBossView();
         renderSingleBossServerList();
       }
     } catch (e) {
-      showToast('紀錄失敗：' + e.message, 'error');
+      if (!isAutoAdjust) showToast('紀錄失敗：' + e.message, 'error');
     }
   }
 
@@ -1063,6 +1311,8 @@
         if (state.records[serverId]) {
           delete state.records[serverId][bossId];
         }
+        if (res.lastActivityAt) state.lastActivityAt = res.lastActivityAt;
+        saveLocalCloudCache();
         renderTopBossTabs();
         renderServerGridBadges();
         renderSingleBossView();
@@ -1070,6 +1320,35 @@
       }
     } catch (e) {
       showToast('清除失敗：' + e.message, 'error');
+    }
+  }
+
+  // Reset ALL Channels (Manual or 3-Hour Inactivity Auto-Reset)
+  async function resetAllChannels(isAuto = false) {
+    if (!isAuto && !confirm('確定要將 S1 ~ S60 所有頻道的王怪紀錄全部重置清空嗎？')) return;
+
+    try {
+      const res = await apiFetch('/api/record/reset-all', {
+        method: 'POST',
+        body: JSON.stringify({ isAuto })
+      });
+      if (res.success) {
+        state.records = {};
+        state.lastActivityAt = res.lastActivityAt || Date.now();
+        saveLocalCloudCache();
+        showToast(
+          isAuto
+            ? '⏰ 已超過 3 小時未刪改任何資料，系統已自動將所有頻道重置！'
+            : '🧹 已將所有頻道紀錄重置清空！',
+          'warn'
+        );
+        renderTopBossTabs();
+        renderServerGridBadges();
+        renderSingleBossView();
+        renderSingleBossServerList();
+      }
+    } catch (e) {
+      if (!isAuto) showToast('重置失敗：' + e.message, 'error');
     }
   }
 
@@ -1122,7 +1401,7 @@
 
       tr.innerHTML = `
         <td><span class="radar-server-tag">${item.serverId}</span></td>
-        <td style="font-weight: 700;">${item.bossName}</td>
+        <td style="font-weight: 700;">${item.bossName} ${item.autoAdjusted30m ? '<span class="auto-30m-badge">61分轉30分</span>' : ''}</td>
         <td style="font-family: var(--font-mono); font-weight: 700; color: ${isAlive ? 'var(--accent-green)' : 'var(--accent-yellow)'}">${countdownText}</td>
         <td>${formatTime(new Date(item.respawnAt))}</td>
         <td>${formatTime(new Date(item.killedAt))} (${item.reporter || '未知'})</td>
@@ -1161,12 +1440,20 @@
 
     state.logs.forEach(log => {
       const tr = document.createElement('tr');
-      const isKill = log.type === 'KILL';
+      let typeHtml = '<span style="color: var(--text-muted)">清除重設</span>';
+      if (log.type === 'KILL') {
+        typeHtml = '<span style="color: var(--accent-green)">擊殺回報</span>';
+      } else if (log.type === 'AUTO_30M') {
+        typeHtml = '<span style="color: var(--accent-yellow)">⚡ 超過61分改剩30分</span>';
+      } else if (log.type === 'AUTO_RESET_3H') {
+        typeHtml = '<span style="color: var(--accent-red)">⏰ 閒置3小時全服重置</span>';
+      }
+
       tr.innerHTML = `
         <td>${formatDateTime(new Date(log.timestamp))}</td>
         <td><span class="radar-server-tag">${log.serverId}</span></td>
         <td style="font-weight: 700;">${log.bossName}</td>
-        <td>${isKill ? '<span style="color: var(--accent-green)">擊殺回報</span>' : '<span style="color: var(--text-muted)">清除重設</span>'}</td>
+        <td>${typeHtml}</td>
         <td>${log.respawnMinutes ? formatMinutes(log.respawnMinutes) : '-'}</td>
         <td>${log.respawnAt ? formatTime(new Date(log.respawnAt)) : '-'}</td>
         <td><span class="user-name-highlight">${log.reporter}</span></td>
@@ -1207,15 +1494,40 @@
     const now = Date.now();
     const threshMs = state.alertThresholdMinutes * 60 * 1000;
 
-    // 1. Check alerts across all servers
+    // Rule 1: Check 3-hour inactivity auto-reset
+    if (hasAnyActiveRecords()) {
+      const remainResetMs = (state.lastActivityAt + THREE_HOURS_MS) - now;
+      if (remainResetMs <= 0) {
+        resetAllChannels(true);
+        return;
+      }
+      if (el.lblInactivityTimer) {
+        el.lblInactivityTimer.textContent = formatDuration(Math.ceil(remainResetMs / 1000));
+      }
+    } else {
+      if (el.lblInactivityTimer) {
+        el.lblInactivityTimer.textContent = '無紀錄';
+      }
+    }
+
+    // Rule 3 & Alerts: Check across all servers
     state.config.servers.forEach(srv => {
       const srvRecs = state.records[srv];
       if (!srvRecs) return;
 
       Object.values(srvRecs).forEach(rec => {
         if (!rec || !rec.respawnAt) return;
-        const diffMs = rec.respawnAt - now;
 
+        // Rule 3: When a channel exceeds 61 minutes since killedAt, automatically set it to remaining 30 minutes
+        if (!rec.autoAdjusted30m && (now - rec.killedAt >= SIXTY_ONE_MINS_MS)) {
+          const newKilledAt = rec.killedAt + SIXTY_ONE_MINS_MS;
+          const newNote = rec.note ? `${rec.note} (超過61分自動改剩30分)` : '超過61分自動改為剩餘30分';
+          rec.autoAdjusted30m = true;
+          saveBossRecord(srv, rec.bossId, newKilledAt, 30, newNote, true);
+          return;
+        }
+
+        const diffMs = rec.respawnAt - now;
         const cacheKey0m = `${srv}_${rec.bossId}_${rec.respawnAt}_0m`;
         const cacheKey1m = `${srv}_${rec.bossId}_${rec.respawnAt}_1m`;
         const cacheKeyThresh = `${srv}_${rec.bossId}_${rec.respawnAt}_thresh`;
@@ -1233,7 +1545,7 @@
       });
     });
 
-    // 2. Update UI for active view
+    // Update UI for active view
     if (state.currentView === 'server') {
       updateSingleBossTimerInPlace();
       renderSingleBossServerList();
@@ -1325,6 +1637,7 @@
           });
           if (res.success) {
             state.config.bosses = state.config.bosses.filter(b => b.id !== boss.id);
+            saveLocalCloudCache();
             getActiveBoss();
             renderTopBossTabs();
             renderBossManagerList();
@@ -1354,6 +1667,7 @@
       if (res.success) {
         const idx = state.config.bosses.findIndex(b => b.id === updatedBoss.id);
         if (idx !== -1) state.config.bosses[idx] = res.boss;
+        saveLocalCloudCache();
         renderTopBossTabs();
         renderBossManagerList();
         renderSingleBossView();
@@ -1367,11 +1681,11 @@
   async function createNewBoss(name, minutes, location = '', note = '') {
     if (!name) {
       alert('請填寫王怪名稱！');
-      return;
+      return false;
     }
     if (isNaN(minutes) || minutes <= 0) {
       alert('請填寫大於 0 的復活分鐘數（例如: 30、45 或 60）！');
-      return;
+      return false;
     }
 
     try {
@@ -1386,6 +1700,7 @@
       if (res.success) {
         showToast(`✅ 成功新增王怪「${name}」 (復活時間 ${formatMinutes(minutes)})！`, 'success');
         state.config.bosses.push(res.boss);
+        saveLocalCloudCache();
         selectBoss(res.boss.id);
         renderBossManagerList();
         return true;
@@ -1398,10 +1713,9 @@
 
   // Network Share Modal
   async function openShareModal() {
-    el.networkLinksContainer.innerHTML = '載入網路位址中...';
+    el.networkLinksContainer.innerHTML = '';
     el.modalShare.style.display = 'flex';
 
-    el.networkLinksContainer.innerHTML = '';
     addShareLink('🌐 GitHub 公開網頁版 (跨網路隨時可用)', 'https://nono86433.github.io/boss-timer/');
 
     if (!isGitHubPages) {
@@ -1508,9 +1822,7 @@
         const name = el.inlineNewBossName.value.trim();
         const mins = parseInt(el.inlineNewBossMinutes.value, 10);
         const ok = await createNewBoss(name, mins);
-        if (ok) {
-          el.inlineNewBossName.value = '';
-        }
+        if (ok) el.inlineNewBossName.value = '';
       });
       el.inlineNewBossName.addEventListener('keydown', async (e) => {
         if (e.key === 'Enter') {
@@ -1519,6 +1831,29 @@
           const ok = await createNewBoss(name, mins);
           if (ok) el.inlineNewBossName.value = '';
         }
+      });
+    }
+
+    // Reset All Channels Button
+    if (el.btnResetAllChannels) {
+      el.btnResetAllChannels.addEventListener('click', () => resetAllChannels(false));
+    }
+
+    // Chat Room Events
+    if (el.btnSendChat) {
+      el.btnSendChat.addEventListener('click', () => sendChatMessage());
+    }
+    if (el.inputChatMessage) {
+      el.inputChatMessage.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') sendChatMessage();
+      });
+    }
+    if (el.chatQuickPhrases) {
+      el.chatQuickPhrases.querySelectorAll('[data-chat-phrase]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const phrase = `[${state.activeServer}] ${btn.dataset.chatPhrase}`;
+          sendChatMessage(phrase);
+        });
       });
     }
 
