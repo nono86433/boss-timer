@@ -22,12 +22,10 @@ const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const FIFTEEN_MINS_MS = 15 * 60 * 1000;
 const THIRTY_MINS_MS = 30 * 60 * 1000;
 
-// Ensure data dir exists
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-// Helpers for data reading & writing
 function readJSON(file, defaultValue) {
   try {
     if (fs.existsSync(file)) {
@@ -71,7 +69,6 @@ const DEFAULT_CONFIG = {
 };
 
 let config = readJSON(CONFIG_FILE, DEFAULT_CONFIG);
-// Ensure default bosses exist without wiping user-added bosses
 if (!config.bosses || config.bosses.length === 0) {
   config.bosses = DEFAULT_CONFIG.bosses;
   writeJSON(CONFIG_FILE, config);
@@ -80,9 +77,81 @@ if (!config.bosses || config.bosses.length === 0) {
 let records = readJSON(RECORDS_FILE, {});
 let logs = readJSON(LOGS_FILE, []);
 let chats = readJSON(CHATS_FILE, []);
-let meta = readJSON(META_FILE, { lastActivityAt: Date.now() });
+let meta = readJSON(META_FILE, {
+  lastActivityAt: Date.now(),
+  lastResetAllAt: 0,
+  deletedRecords: {}
+});
+if (!meta.deletedRecords) meta.deletedRecords = {};
+if (!meta.lastResetAllAt) meta.lastResetAllAt = 0;
 
-// Prune chats older than 24 hours
+// Compute deterministic 3-round cycle state for a record
+function computeRecordCycle(rec, now = Date.now()) {
+  if (!rec) return { expired: true };
+
+  let r1Start, r1Respawn, r2Start, r2Respawn, r3Start, r3Respawn, expireDeleteAt;
+  const baseMins = Number(rec.baseRespawnMinutes || rec.respawnMinutes || 45);
+
+  if (rec.baseKilledAt) {
+    r1Start = Number(rec.baseKilledAt);
+    r1Respawn = r1Start + baseMins * 60000;
+    r2Start = r1Respawn + FIFTEEN_MINS_MS;
+    r2Respawn = r2Start + THIRTY_MINS_MS;
+    r3Start = r2Respawn + FIFTEEN_MINS_MS;
+    r3Respawn = r3Start + THIRTY_MINS_MS;
+    expireDeleteAt = r3Respawn + FIFTEEN_MINS_MS;
+  } else if (rec.autoAdjusted30m) {
+    // Legacy record that was already in Round 2
+    r2Start = Number(rec.killedAt);
+    r2Respawn = Number(rec.respawnAt);
+    r1Start = r2Start - FIFTEEN_MINS_MS - baseMins * 60000;
+    r1Respawn = r2Start - FIFTEEN_MINS_MS;
+    r3Start = r2Respawn + FIFTEEN_MINS_MS;
+    r3Respawn = r3Start + THIRTY_MINS_MS;
+    expireDeleteAt = r3Respawn + FIFTEEN_MINS_MS;
+  } else {
+    r1Start = Number(rec.killedAt);
+    r1Respawn = Number(rec.respawnAt) || (r1Start + baseMins * 60000);
+    r2Start = r1Respawn + FIFTEEN_MINS_MS;
+    r2Respawn = r2Start + THIRTY_MINS_MS;
+    r3Start = r2Respawn + FIFTEEN_MINS_MS;
+    r3Respawn = r3Start + THIRTY_MINS_MS;
+    expireDeleteAt = r3Respawn + FIFTEEN_MINS_MS;
+  }
+
+  if (now >= expireDeleteAt) {
+    return { expired: true, round: 4, expireDeleteAt };
+  }
+  if (now >= r3Start) {
+    return {
+      expired: false,
+      round: 3,
+      phaseStartAt: r3Start,
+      phaseRespawnAt: r3Respawn,
+      phaseMinutes: 30,
+      diffMs: r3Respawn - now
+    };
+  }
+  if (now >= r2Start) {
+    return {
+      expired: false,
+      round: 2,
+      phaseStartAt: r2Start,
+      phaseRespawnAt: r2Respawn,
+      phaseMinutes: 30,
+      diffMs: r2Respawn - now
+    };
+  }
+  return {
+    expired: false,
+    round: 1,
+    phaseStartAt: r1Start,
+    phaseRespawnAt: r1Respawn,
+    phaseMinutes: baseMins,
+    diffMs: r1Respawn - now
+  };
+}
+
 function pruneOldChats() {
   const now = Date.now();
   const beforeLen = chats.length;
@@ -92,7 +161,6 @@ function pruneOldChats() {
   }
 }
 
-// Check 3-hour inactivity auto-reset & 61-minute -> 30-minute auto-adjustment
 function checkAutoRules() {
   const now = Date.now();
   let hasAnyRecord = false;
@@ -103,49 +171,45 @@ function checkAutoRules() {
     if (!srvRecs) continue;
     for (const bossId of Object.keys(srvRecs)) {
       const rec = srvRecs[bossId];
-      if (!rec || !rec.respawnAt) continue;
-      hasAnyRecord = true;
+      if (!rec) continue;
 
-      // Rule 3: Whenever a channel is unedited for 15 minutes after boss respawn (respawnAt), automatically set to countdown 30 minutes (repeats every cycle until 3h reset)
-      if (now - rec.respawnAt >= FIFTEEN_MINS_MS) {
-        let newKilledAt = rec.killedAt;
-        let newRespawnAt = rec.respawnAt;
-        while (now - newRespawnAt >= FIFTEEN_MINS_MS) {
-          newKilledAt = newRespawnAt + FIFTEEN_MINS_MS;
-          newRespawnAt = newKilledAt + THIRTY_MINS_MS;
-        }
-        rec.killedAt = newKilledAt;
-        rec.respawnMinutes = 30;
-        rec.respawnAt = newRespawnAt;
-        rec.autoAdjusted30m = true;
-        rec.updatedAt = now;
-        if (!rec.note || !rec.note.includes('自動')) {
-          rec.note = rec.note ? `${rec.note} (重生15分未編輯自動倒數30分)` : '重生後15分未編輯，自動改為倒數30分';
-        }
+      const cycle = computeRecordCycle(rec, now);
+      if (cycle.expired) {
+        // 3 rounds completed without manual edit -> automatically delete!
+        const bossName = rec.bossName || bossId;
+        delete srvRecs[bossId];
+        meta.deletedRecords[`${srv}_${bossId}`] = now;
         recordsChanged = true;
 
         const logEntry = {
           id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
-          type: 'AUTO_30M',
+          type: 'AUTO_DEL_3R',
           serverId: srv,
           bossId,
-          bossName: rec.bossName,
-          killedAt: newKilledAt,
-          respawnAt: newRespawnAt,
-          respawnMinutes: 30,
-          reporter: '系統自動(重生15分轉倒數30分)',
+          bossName,
+          reporter: '系統自動(三輪未編輯刪除)',
           timestamp: now
         };
         logs.unshift(logEntry);
         if (logs.length > 200) logs.pop();
 
         broadcast({
-          type: 'RECORD_UPDATED',
-          record: rec,
+          type: 'RECORD_CLEARED',
+          serverId: srv,
+          bossId,
+          bossName,
+          reporter: '系統自動(滿三輪未編輯刪除)',
+          deletedAt: now,
+          lastActivityAt: meta.lastActivityAt,
           log: logEntry,
-          isAutoAdjust: true
+          isAutoDelete3R: true
         });
+      } else {
+        hasAnyRecord = true;
       }
+    }
+    if (Object.keys(srvRecs).length === 0) {
+      delete records[srv];
     }
   }
 
@@ -153,6 +217,7 @@ function checkAutoRules() {
   if (hasAnyRecord && meta.lastActivityAt && (now - meta.lastActivityAt >= THREE_HOURS_MS)) {
     records = {};
     meta.lastActivityAt = now;
+    meta.lastResetAllAt = now;
     writeJSON(RECORDS_FILE, records);
     writeJSON(META_FILE, meta);
 
@@ -172,6 +237,7 @@ function checkAutoRules() {
     broadcast({
       type: 'ALL_RECORDS_RESET',
       lastActivityAt: meta.lastActivityAt,
+      lastResetAllAt: meta.lastResetAllAt,
       log: logEntry
     });
     return;
@@ -179,6 +245,7 @@ function checkAutoRules() {
 
   if (recordsChanged) {
     writeJSON(RECORDS_FILE, records);
+    writeJSON(META_FILE, meta);
     writeJSON(LOGS_FILE, logs);
   }
 }
@@ -186,7 +253,6 @@ function checkAutoRules() {
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Authentication middleware
 function checkAuth(req, res, next) {
   const identity = req.headers['x-user-identity'] || req.query.identity;
   if (!identity || !config.authNames.includes(decodeURIComponent(identity))) {
@@ -199,7 +265,6 @@ function checkAuth(req, res, next) {
   next();
 }
 
-// API: Verify login
 app.post('/api/auth', (req, res) => {
   const { name } = req.body;
   if (!name || !config.authNames.includes(name.trim())) {
@@ -214,7 +279,6 @@ app.post('/api/auth', (req, res) => {
   });
 });
 
-// API: Network Info (for sharing URL across LAN/phones)
 app.get('/api/network-info', (req, res) => {
   const interfaces = os.networkInterfaces();
   const addresses = [];
@@ -231,7 +295,6 @@ app.get('/api/network-info', (req, res) => {
   });
 });
 
-// API: Get initial state (protected)
 app.get('/api/state', checkAuth, (req, res) => {
   pruneOldChats();
   checkAutoRules();
@@ -241,20 +304,22 @@ app.get('/api/state', checkAuth, (req, res) => {
     records,
     logs: logs.slice(0, 100),
     chats,
-    lastActivityAt: meta.lastActivityAt || Date.now()
+    lastActivityAt: meta.lastActivityAt || Date.now(),
+    lastResetAllAt: meta.lastResetAllAt || 0,
+    deletedRecords: meta.deletedRecords || {}
   });
 });
 
-// API: Record boss kill time (protected)
 app.post('/api/record', checkAuth, (req, res) => {
-  const { serverId, bossId, killedAt, respawnMinutes, note, isAutoAdjust } = req.body;
-  const reporter = isAutoAdjust ? '系統自動(重生15分轉倒數30分)' : req.currentUser;
+  const { serverId, bossId, killedAt, respawnMinutes, note } = req.body;
+  const reporter = req.currentUser;
 
   if (!serverId || !bossId) {
     return res.status(400).json({ success: false, error: '缺少 serverId 或 bossId' });
   }
 
-  const kTime = killedAt ? Number(killedAt) : Date.now();
+  const now = Date.now();
+  const kTime = killedAt ? Number(killedAt) : now;
   const rMinutes = Number(respawnMinutes) > 0 ? Number(respawnMinutes) : 45;
   const respawnAt = kTime + rMinutes * 60 * 1000;
 
@@ -268,26 +333,26 @@ app.post('/api/record', checkAuth, (req, res) => {
     serverId,
     bossId,
     bossName: bossDef.name,
+    baseKilledAt: kTime,
+    baseRespawnMinutes: rMinutes,
     killedAt: kTime,
     respawnMinutes: rMinutes,
     respawnAt,
     reporter,
     note: note || '',
-    autoAdjusted30m: Boolean(isAutoAdjust),
-    updatedAt: Date.now()
+    updatedAt: now
   };
 
   records[serverId][bossId] = recordEntry;
-  writeJSON(RECORDS_FILE, records);
+  delete meta.deletedRecords[`${serverId}_${bossId}`];
+  meta.lastActivityAt = now;
 
-  if (!isAutoAdjust) {
-    meta.lastActivityAt = Date.now();
-    writeJSON(META_FILE, meta);
-  }
+  writeJSON(RECORDS_FILE, records);
+  writeJSON(META_FILE, meta);
 
   const logEntry = {
-    id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-    type: isAutoAdjust ? 'AUTO_30M' : 'KILL',
+    id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
+    type: 'KILL',
     serverId,
     bossId,
     bossName: bossDef.name,
@@ -296,7 +361,7 @@ app.post('/api/record', checkAuth, (req, res) => {
     respawnMinutes: rMinutes,
     reporter,
     note: note || '',
-    timestamp: Date.now()
+    timestamp: now
   };
 
   logs.unshift(logEntry);
@@ -307,69 +372,74 @@ app.post('/api/record', checkAuth, (req, res) => {
     type: 'RECORD_UPDATED',
     record: recordEntry,
     log: logEntry,
-    lastActivityAt: meta.lastActivityAt,
-    isAutoAdjust: Boolean(isAutoAdjust)
+    lastActivityAt: meta.lastActivityAt
   });
 
   res.json({ success: true, record: recordEntry, lastActivityAt: meta.lastActivityAt });
 });
 
-// API: Clear/Reset a boss record (protected)
 app.post('/api/record/clear', checkAuth, (req, res) => {
-  const { serverId, bossId } = req.body;
-  const reporter = req.currentUser;
+  const { serverId, bossId, isAutoDelete3R } = req.body;
+  const reporter = isAutoDelete3R ? '系統自動(滿三輪未編輯刪除)' : req.currentUser;
+  const now = Date.now();
 
+  const bossDef = config.bosses.find(b => b.id === bossId) || { name: bossId };
   if (records[serverId] && records[serverId][bossId]) {
-    const bossDef = config.bosses.find(b => b.id === bossId) || { name: bossId };
     delete records[serverId][bossId];
-    writeJSON(RECORDS_FILE, records);
-
-    meta.lastActivityAt = Date.now();
-    writeJSON(META_FILE, meta);
-
-    const logEntry = {
-      id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-      type: 'CLEAR',
-      serverId,
-      bossId,
-      bossName: bossDef.name,
-      reporter,
-      timestamp: Date.now()
-    };
-    logs.unshift(logEntry);
-    if (logs.length > 200) logs.pop();
-    writeJSON(LOGS_FILE, logs);
-
-    broadcast({
-      type: 'RECORD_CLEARED',
-      serverId,
-      bossId,
-      bossName: bossDef.name,
-      reporter,
-      lastActivityAt: meta.lastActivityAt,
-      log: logEntry
-    });
+  }
+  meta.deletedRecords[`${serverId}_${bossId}`] = now;
+  if (!isAutoDelete3R) {
+    meta.lastActivityAt = now;
   }
 
-  res.json({ success: true, lastActivityAt: meta.lastActivityAt });
-});
-
-// API: Reset ALL channels (protected)
-app.post('/api/record/reset-all', checkAuth, (req, res) => {
-  const { isAuto } = req.body || {};
-  records = {};
-  meta.lastActivityAt = Date.now();
   writeJSON(RECORDS_FILE, records);
   writeJSON(META_FILE, meta);
 
   const logEntry = {
-    id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+    id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
+    type: isAutoDelete3R ? 'AUTO_DEL_3R' : 'CLEAR',
+    serverId,
+    bossId,
+    bossName: bossDef.name,
+    reporter,
+    timestamp: now
+  };
+  logs.unshift(logEntry);
+  if (logs.length > 200) logs.pop();
+  writeJSON(LOGS_FILE, logs);
+
+  broadcast({
+    type: 'RECORD_CLEARED',
+    serverId,
+    bossId,
+    bossName: bossDef.name,
+    reporter,
+    deletedAt: now,
+    lastActivityAt: meta.lastActivityAt,
+    log: logEntry,
+    isAutoDelete3R: Boolean(isAutoDelete3R)
+  });
+
+  res.json({ success: true, lastActivityAt: meta.lastActivityAt, deletedAt: now });
+});
+
+app.post('/api/record/reset-all', checkAuth, (req, res) => {
+  const { isAuto } = req.body || {};
+  const now = Date.now();
+  records = {};
+  meta.lastActivityAt = now;
+  meta.lastResetAllAt = now;
+  writeJSON(RECORDS_FILE, records);
+  writeJSON(META_FILE, meta);
+
+  const logEntry = {
+    id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
     type: isAuto ? 'AUTO_RESET_3H' : 'CLEAR',
     serverId: 'ALL',
     bossId: 'ALL',
     bossName: '全頻道',
     reporter: isAuto ? '系統自動(閒置3小時重置)' : req.currentUser,
-    timestamp: Date.now()
+    timestamp: now
   };
   logs.unshift(logEntry);
   if (logs.length > 200) logs.pop();
@@ -378,13 +448,13 @@ app.post('/api/record/reset-all', checkAuth, (req, res) => {
   broadcast({
     type: 'ALL_RECORDS_RESET',
     lastActivityAt: meta.lastActivityAt,
+    lastResetAllAt: meta.lastResetAllAt,
     log: logEntry
   });
 
-  res.json({ success: true, lastActivityAt: meta.lastActivityAt });
+  res.json({ success: true, lastActivityAt: meta.lastActivityAt, lastResetAllAt: meta.lastResetAllAt });
 });
 
-// API: Send Chat Message (protected, kept for 24 hours)
 app.post('/api/chat', checkAuth, (req, res) => {
   const { text } = req.body;
   if (!text || !String(text).trim()) {
@@ -414,7 +484,6 @@ app.post('/api/chat', checkAuth, (req, res) => {
   res.json({ success: true, chat: chatMsg });
 });
 
-// API: Manage boss definitions (add/edit/delete) (protected)
 app.post('/api/bosses', checkAuth, (req, res) => {
   const { action, boss } = req.body;
 
@@ -464,7 +533,6 @@ app.post('/api/bosses', checkAuth, (req, res) => {
   res.status(400).json({ success: false, error: '無效的操作' });
 });
 
-// Broadcast helper for WebSocket
 function broadcast(messageObj) {
   const messageStr = JSON.stringify(messageObj);
   wss.clients.forEach(client => {
@@ -474,7 +542,6 @@ function broadcast(messageObj) {
   });
 }
 
-// WebSocket connection management
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.isAuthorized = false;
@@ -502,13 +569,11 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Periodic server-side check for 3h reset, 61m->30m adjustment, and 24h chat pruning
 const rulesInterval = setInterval(() => {
   pruneOldChats();
   checkAutoRules();
 }, 5000);
 
-// Ping interval to keep connections alive
 const wsPingInterval = setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();

@@ -1271,6 +1271,102 @@ body {
 .server-mini-timer.counting {
   color: var(--accent-cyan);
 }
+.server-mini-timer.round-2 {
+  color: #c084fc;
+}
+.server-mini-timer.round-3 {
+  color: #fb923c;
+}
+
+.server-badge-dot.round-2 {
+  background-color: #c084fc;
+  box-shadow: 0 0 6px #c084fc;
+}
+.server-badge-dot.round-3 {
+  background-color: #fb923c;
+  box-shadow: 0 0 6px #fb923c;
+  animation: pulse-warn 1.5s infinite;
+}
+
+/* Round 2 & Round 3 Distinct Boss Card & Badge Styles */
+.boss-card.status-round-2 {
+  border-color: rgba(168, 85, 247, 0.75);
+  box-shadow: 0 0 22px rgba(168, 85, 247, 0.25);
+  background: linear-gradient(145deg, rgba(35, 22, 56, 0.88), rgba(22, 29, 43, 0.9));
+}
+
+.boss-card.status-round-3 {
+  border-color: rgba(249, 115, 22, 0.85);
+  box-shadow: 0 0 24px rgba(249, 115, 22, 0.28);
+  background: linear-gradient(145deg, rgba(56, 28, 18, 0.88), rgba(22, 29, 43, 0.9));
+}
+
+.badge-round-2 {
+  background: rgba(168, 85, 247, 0.22);
+  color: #d8b4fe;
+  border: 1px solid rgba(192, 132, 252, 0.55);
+}
+
+.badge-round-3 {
+  background: rgba(249, 115, 22, 0.22);
+  color: #fdba74;
+  border: 1px solid rgba(251, 146, 60, 0.6);
+}
+
+.countdown-main.round-2 {
+  color: #c084fc;
+}
+
+.countdown-main.round-3 {
+  color: #fb923c;
+}
+
+.timer-progress-fill.round-2 {
+  background: linear-gradient(90deg, #9333ea, #c084fc);
+}
+
+.timer-progress-fill.round-3 {
+  background: linear-gradient(90deg, #ea580c, #fb923c);
+}
+
+.round-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  margin-left: 6px;
+}
+
+.round-tag.r1 {
+  background: rgba(56, 189, 248, 0.14);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.round-tag.r2 {
+  background: rgba(168, 85, 247, 0.22);
+  color: #e9d5ff;
+  border: 1px solid rgba(192, 132, 252, 0.5);
+}
+
+.round-tag.r3 {
+  background: rgba(249, 115, 22, 0.22);
+  color: #fed7aa;
+  border: 1px solid rgba(251, 146, 60, 0.55);
+}
+
+.srv-summary-row.row-round-2 {
+  border-left: 4px solid #a855f7;
+  background: rgba(168, 85, 247, 0.08);
+}
+
+.srv-summary-row.row-round-3 {
+  border-left: 4px solid #f97316;
+  background: rgba(249, 115, 22, 0.08);
+}
 
 /* Mobile responsive */
 @media (max-width: 1100px) {

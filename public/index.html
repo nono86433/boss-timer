@@ -23,11 +23,15 @@
       </div>
 
       <div class="header-controls">
-        <!-- Live Connection Status -->
+        <!-- Live Connection Status & Manual Sync Button -->
         <div class="status-indicator" id="connStatus">
           <span class="status-dot disconnected" id="connDot"></span>
           <span id="connText">連線中...</span>
         </div>
+
+        <button class="btn btn-primary btn-sm" id="btnManualSync" title="立即與隊友同步所有頻道最新資料">
+          🔄 立即同步
+        </button>
 
         <!-- 3-Hour Inactivity Auto-Reset Countdown Pill -->
         <div class="status-indicator" id="inactivityResetPill" title="當超過 3 小時沒有新增或刪改任何頻道資料，將自動重置所有頻道">
@@ -84,8 +88,8 @@
             <span>👑 1. 先選擇或輸入要記錄的王怪（點選後下方僅顯示該隻王的紀錄）</span>
           </div>
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-            <span class="meta-tag" style="color: var(--accent-yellow); border: 1px solid rgba(245, 158, 11, 0.3);">
-              ⚡ 規則：王重生後 15 分鐘未編輯自動改為倒數 30 分鐘 ｜ 閒置 3 小時自動全服重置
+            <span class="meta-tag" style="color: #c084fc; border: 1px solid rgba(192, 132, 252, 0.35);">
+              🟣 重生15分未編輯 ➔ 轉「第二輪」倒數30分(紫色) ｜ 🟠 轉「第三輪」(橘色) ｜ 🗑️ 滿三輪未編輯自動刪除
             </span>
             <button class="btn btn-secondary btn-sm" id="btnQuickAddBoss">+ 新增 / 管理王怪設定</button>
           </div>
@@ -144,6 +148,7 @@
               </div>
               <div style="display: flex; gap: 6px; align-items: center;">
                 <span class="meta-tag" id="lblActiveBossServerCount">0 個頻道</span>
+                <button type="button" class="btn btn-secondary btn-sm" id="btnListSync" title="立即同步最新頻道資料">🔄 同步</button>
                 <button type="button" class="btn btn-danger btn-sm" id="btnResetAllChannels" title="手動將所有頻道紀錄重置清空">🧹 全服重置</button>
               </div>
             </div>

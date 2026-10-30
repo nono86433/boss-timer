@@ -1,4 +1,6 @@
-// Main Application Logic for Boss Respawn Tracker (Single-Boss Focused Mode + 3H Reset + 61M->30M + 24H Chat)
+// Main Application Logic for Boss Respawn Tracker
+// Features: Single-Boss Focus, 3-Round Auto Cycle (Purple R2, Orange R3, Auto-Delete after R3),
+// 3-Hour Inactivity Reset, 24-Hour Chat Room, and Conflict-Free Multi-User Sync
 (function () {
   'use strict';
 
@@ -36,6 +38,8 @@
       bosses: [...DEFAULT_BOSSES]
     },
     records: {},
+    deletedRecords: {},
+    lastResetAllAt: parseInt(localStorage.getItem('boss_last_reset_all') || '0', 10),
     logs: [],
     chats: [],
     lastActivityAt: parseInt(localStorage.getItem('boss_last_activity') || String(Date.now()), 10),
@@ -44,7 +48,10 @@
     currentView: 'server', // 'server' | 'radar' | 'history'
     alertThresholdMinutes: parseInt(localStorage.getItem('boss_alert_minutes') || '5', 10),
     alertedCache: new Set(),
-    tickerId: null
+    notifiedRoundCache: new Set(),
+    tickerId: null,
+    autoSyncId: null,
+    isSyncing: false
   };
 
   // DOM Elements
@@ -55,6 +62,7 @@
     connStatus: document.getElementById('connStatus'),
     connDot: document.getElementById('connDot'),
     connText: document.getElementById('connText'),
+    btnManualSync: document.getElementById('btnManualSync'),
     lblInactivityTimer: document.getElementById('lblInactivityTimer'),
     btnToggleSound: document.getElementById('btnToggleSound'),
     btnToggleVoice: document.getElementById('btnToggleVoice'),
@@ -90,6 +98,7 @@
     singleBossContainer: document.getElementById('singleBossContainer'),
     lblSummaryBossName: document.getElementById('lblSummaryBossName'),
     lblActiveBossServerCount: document.getElementById('lblActiveBossServerCount'),
+    btnListSync: document.getElementById('btnListSync'),
     btnResetAllChannels: document.getElementById('btnResetAllChannels'),
     singleBossServerList: document.getElementById('singleBossServerList'),
 
@@ -128,7 +137,87 @@
     toastContainer: document.getElementById('toastContainer')
   };
 
-  // Get currently selected Boss object
+  // Deterministic 3-Round Lifecycle Calculator
+  // Round 1: Manual record -> Respawns after baseRespawnMinutes -> Waits 15m
+  // Round 2: Auto 30m countdown (Purple) -> Respawns after 30m -> Waits 15m
+  // Round 3: Auto 30m countdown (Orange) -> Respawns after 30m -> Waits 15m
+  // After Round 3 + 15m without manual edit -> Expired & Automatically Deleted!
+  function computeRecordCycle(rec, now = Date.now()) {
+    if (!rec) return { expired: true };
+
+    let r1Start, r1Respawn, r2Start, r2Respawn, r3Start, r3Respawn, expireDeleteAt;
+    const baseMins = Number(rec.baseRespawnMinutes || rec.respawnMinutes || 45);
+
+    if (rec.baseKilledAt) {
+      r1Start = Number(rec.baseKilledAt);
+      r1Respawn = r1Start + baseMins * 60000;
+      r2Start = r1Respawn + FIFTEEN_MINS_MS;
+      r2Respawn = r2Start + THIRTY_MINS_MS;
+      r3Start = r2Respawn + FIFTEEN_MINS_MS;
+      r3Respawn = r3Start + THIRTY_MINS_MS;
+      expireDeleteAt = r3Respawn + FIFTEEN_MINS_MS;
+    } else if (rec.autoAdjusted30m) {
+      // Legacy record that was already in Round 2
+      r2Start = Number(rec.killedAt);
+      r2Respawn = Number(rec.respawnAt);
+      r1Start = r2Start - FIFTEEN_MINS_MS - baseMins * 60000;
+      r1Respawn = r2Start - FIFTEEN_MINS_MS;
+      r3Start = r2Respawn + FIFTEEN_MINS_MS;
+      r3Respawn = r3Start + THIRTY_MINS_MS;
+      expireDeleteAt = r3Respawn + FIFTEEN_MINS_MS;
+    } else {
+      r1Start = Number(rec.killedAt);
+      r1Respawn = Number(rec.respawnAt) || (r1Start + baseMins * 60000);
+      r2Start = r1Respawn + FIFTEEN_MINS_MS;
+      r2Respawn = r2Start + THIRTY_MINS_MS;
+      r3Start = r2Respawn + FIFTEEN_MINS_MS;
+      r3Respawn = r3Start + THIRTY_MINS_MS;
+      expireDeleteAt = r3Respawn + FIFTEEN_MINS_MS;
+    }
+
+    if (now >= expireDeleteAt) {
+      return {
+        expired: true,
+        round: 4,
+        expireDeleteAt
+      };
+    }
+
+    if (now >= r3Start) {
+      return {
+        expired: false,
+        round: 3,
+        phaseStartAt: r3Start,
+        phaseRespawnAt: r3Respawn,
+        phaseMinutes: 30,
+        diffMs: r3Respawn - now,
+        nextTransitionAt: expireDeleteAt
+      };
+    }
+
+    if (now >= r2Start) {
+      return {
+        expired: false,
+        round: 2,
+        phaseStartAt: r2Start,
+        phaseRespawnAt: r2Respawn,
+        phaseMinutes: 30,
+        diffMs: r2Respawn - now,
+        nextTransitionAt: r3Start
+      };
+    }
+
+    return {
+      expired: false,
+      round: 1,
+      phaseStartAt: r1Start,
+      phaseRespawnAt: r1Respawn,
+      phaseMinutes: baseMins,
+      diffMs: r1Respawn - now,
+      nextTransitionAt: r2Start
+    };
+  }
+
   function getActiveBoss() {
     if (!state.config.bosses || state.config.bosses.length === 0) {
       state.config.bosses = [...DEFAULT_BOSSES];
@@ -142,7 +231,6 @@
     return found;
   }
 
-  // Count total active records across all servers and bosses
   function hasAnyActiveRecords() {
     for (const srv of Object.keys(state.records)) {
       const srvRecs = state.records[srv];
@@ -151,18 +239,18 @@
     return false;
   }
 
-  // Persist state to localStorage (ensures data survives page reloads & code updates)
   function saveLocalCloudCache() {
     try {
       localStorage.setItem('boss_cloud_config', JSON.stringify(state.config));
       localStorage.setItem('boss_cloud_records', JSON.stringify(state.records));
+      localStorage.setItem('boss_cloud_deleted', JSON.stringify(state.deletedRecords));
+      localStorage.setItem('boss_last_reset_all', String(state.lastResetAllAt));
       localStorage.setItem('boss_cloud_logs', JSON.stringify(state.logs.slice(0, 200)));
       localStorage.setItem('boss_cloud_chats', JSON.stringify(state.chats.slice(-300)));
       localStorage.setItem('boss_last_activity', String(state.lastActivityAt));
     } catch (e) {}
   }
 
-  // Merge bosses non-destructively so code updates never wipe user-added bosses
   function mergeBossesNonDestructive(existingBosses, incomingBosses) {
     const map = new Map();
     DEFAULT_BOSSES.forEach(b => map.set(b.id, { ...b }));
@@ -173,6 +261,63 @@
       if (b && b.id) map.set(b.id, { ...b });
     });
     return Array.from(map.values());
+  }
+
+  // Reconcile state.records against deletedRecords, lastResetAllAt, and 3-round expiration
+  function reconcileRecordsState(incomingRecords, incomingDeleted, incomingResetAllAt) {
+    if (incomingResetAllAt && incomingResetAllAt > state.lastResetAllAt) {
+      state.lastResetAllAt = incomingResetAllAt;
+    }
+
+    if (incomingDeleted) {
+      for (const [key, delTs] of Object.entries(incomingDeleted)) {
+        if (!state.deletedRecords[key] || delTs > state.deletedRecords[key]) {
+          state.deletedRecords[key] = delTs;
+        }
+      }
+    }
+
+    // Merge incoming records if newer
+    if (incomingRecords) {
+      for (const srv of Object.keys(incomingRecords)) {
+        const srvRecs = incomingRecords[srv] || {};
+        for (const bossId of Object.keys(srvRecs)) {
+          const r = srvRecs[bossId];
+          if (!r) continue;
+          if (!state.records[srv]) state.records[srv] = {};
+          const cur = state.records[srv][bossId];
+          const rTime = r.updatedAt || r.killedAt || 0;
+          const curTime = cur ? (cur.updatedAt || cur.killedAt || 0) : 0;
+          if (!cur || rTime >= curTime) {
+            state.records[srv][bossId] = r;
+          }
+        }
+      }
+    }
+
+    // Purge any record older than lastResetAllAt, deletedRecords[key], or 3-round expiration
+    const now = Date.now();
+    for (const srv of Object.keys(state.records)) {
+      const srvRecs = state.records[srv];
+      if (!srvRecs) continue;
+      for (const bossId of Object.keys(srvRecs)) {
+        const rec = srvRecs[bossId];
+        if (!rec) {
+          delete srvRecs[bossId];
+          continue;
+        }
+        const recTs = rec.updatedAt || rec.killedAt || 0;
+        const delTs = state.deletedRecords[`${srv}_${bossId}`] || 0;
+        const cycle = computeRecordCycle(rec, now);
+
+        if (recTs <= state.lastResetAllAt || recTs <= delTs || cycle.expired) {
+          delete srvRecs[bossId];
+        }
+      }
+      if (Object.keys(srvRecs).length === 0) {
+        delete state.records[srv];
+      }
+    }
   }
 
   // Setup LiveSocket
@@ -195,40 +340,28 @@
 
   // Handle incoming real-time socket events
   function handleSocketMessage(msg) {
-    if (msg.type === 'RECORD_UPDATED') {
+    if (msg.type === 'RECORD_UPDATED' && msg.record) {
       const rec = msg.record;
-      if (!state.records[rec.serverId]) state.records[rec.serverId] = {};
-      state.records[rec.serverId][rec.bossId] = rec;
+      reconcileRecordsState({ [rec.serverId]: { [rec.bossId]: rec } }, msg.deletedRecords, msg.lastResetAllAt);
 
-      if (!msg.isAutoAdjust) {
-        state.lastActivityAt = msg.lastActivityAt || Date.now();
+      if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+        state.lastActivityAt = msg.lastActivityAt;
       }
-
       if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
         state.logs.unshift(msg.log);
         if (state.logs.length > 200) state.logs.pop();
       }
       saveLocalCloudCache();
 
-      if (msg.isAutoAdjust) {
-        showToast(`⚡ [${rec.serverId}] ${rec.bossName} 重生後 15 分鐘未編輯，自動改為倒數 30 分鐘！`, 'warn');
-      } else {
-        showToast(`📢 ${rec.reporter} 更新了 [${rec.serverId}] ${rec.bossName} 的打死時間！`, 'info');
-      }
-
-      renderTopBossTabs();
-      renderServerGridBadges();
-      if (state.currentView === 'server') {
-        renderSingleBossView();
-        renderSingleBossServerList();
-      }
-      if (state.currentView === 'radar') renderRadarView();
-      if (state.currentView === 'history') renderHistoryView();
+      showToast(`📢 ${rec.reporter} 更新了 [${rec.serverId}] ${rec.bossName} 的打死時間！`, 'info');
+      refreshAllViews();
     } else if (msg.type === 'RECORD_CLEARED') {
-      if (state.records[msg.serverId]) {
-        delete state.records[msg.serverId][msg.bossId];
+      const delTs = msg.deletedAt || Date.now();
+      reconcileRecordsState(null, { [`${msg.serverId}_${msg.bossId}`]: delTs }, msg.lastResetAllAt);
+
+      if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+        state.lastActivityAt = msg.lastActivityAt;
       }
-      state.lastActivityAt = msg.lastActivityAt || Date.now();
       if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
         state.logs.unshift(msg.log);
       }
@@ -236,32 +369,34 @@
 
       const bName = msg.bossName || (msg.log && msg.log.bossName) || '王怪';
       const rep = msg.reporter || (msg.log && msg.log.reporter) || '';
-      showToast(`🔄 [${msg.serverId}] ${bName} 紀錄已被 ${rep} 清除`, 'info');
-      renderTopBossTabs();
-      renderServerGridBadges();
-      if (state.currentView === 'server') {
-        renderSingleBossView();
-        renderSingleBossServerList();
+      if (msg.isAutoDelete3R) {
+        showToast(`🗑️ [${msg.serverId}] ${bName} 連續三輪未手動編輯，已自動刪除紀錄（請重新找王時間）！`, 'warn');
+      } else {
+        showToast(`🔄 [${msg.serverId}] ${bName} 紀錄已被 ${rep} 清除`, 'info');
       }
-      if (state.currentView === 'radar') renderRadarView();
-      if (state.currentView === 'history') renderHistoryView();
+      refreshAllViews();
     } else if (msg.type === 'ALL_RECORDS_RESET') {
+      const resetTs = msg.lastResetAllAt || Date.now();
       state.records = {};
-      state.lastActivityAt = msg.lastActivityAt || Date.now();
+      state.lastResetAllAt = Math.max(state.lastResetAllAt, resetTs);
+      state.lastActivityAt = msg.lastActivityAt || resetTs;
       if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
         state.logs.unshift(msg.log);
       }
       saveLocalCloudCache();
 
       showToast('⏰ 所有頻道紀錄已重置清空！', 'warn');
-      renderTopBossTabs();
-      renderServerGridBadges();
-      if (state.currentView === 'server') {
-        renderSingleBossView();
-        renderSingleBossServerList();
+      refreshAllViews();
+    } else if (msg.type === 'STATE_SNAPSHOT') {
+      if (msg.config && msg.config.bosses) {
+        state.config.bosses = mergeBossesNonDestructive(state.config.bosses, msg.config.bosses);
       }
-      if (state.currentView === 'radar') renderRadarView();
-      if (state.currentView === 'history') renderHistoryView();
+      if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+        state.lastActivityAt = msg.lastActivityAt;
+      }
+      reconcileRecordsState(msg.records, msg.deletedRecords, msg.lastResetAllAt);
+      saveLocalCloudCache();
+      refreshAllViews();
     } else if (msg.type === 'CHAT_MESSAGE' && msg.chat) {
       pruneOldChatsInState();
       if (!state.chats.some(c => c.id === msg.chat.id)) {
@@ -277,13 +412,21 @@
       state.config = msg.config;
       saveLocalCloudCache();
       getActiveBoss();
-      renderTopBossTabs();
       renderBossManagerList();
-      renderServerGridBadges();
-      renderSingleBossView();
-      renderSingleBossServerList();
+      refreshAllViews();
       showToast('⚙️ 王怪與復活時間設定已同步更新！', 'success');
     }
+  }
+
+  function refreshAllViews() {
+    renderTopBossTabs();
+    renderServerGridBadges();
+    if (state.currentView === 'server') {
+      renderSingleBossView();
+      renderSingleBossServerList();
+    }
+    if (state.currentView === 'radar') renderRadarView();
+    if (state.currentView === 'history') renderHistoryView();
   }
 
   // API helper with authentication header & GitHub Pages Cloud Sync Mode
@@ -329,6 +472,10 @@
         }
         const savedRec = localStorage.getItem('boss_cloud_records');
         if (savedRec) state.records = JSON.parse(savedRec);
+        const savedDel = localStorage.getItem('boss_cloud_deleted');
+        if (savedDel) state.deletedRecords = JSON.parse(savedDel);
+        const savedReset = localStorage.getItem('boss_last_reset_all');
+        if (savedReset) state.lastResetAllAt = parseInt(savedReset, 10) || 0;
         const savedLogs = localStorage.getItem('boss_cloud_logs');
         if (savedLogs) state.logs = JSON.parse(savedLogs);
         const savedChats = localStorage.getItem('boss_cloud_chats');
@@ -337,9 +484,11 @@
         if (savedAct) state.lastActivityAt = parseInt(savedAct, 10) || Date.now();
       } catch (e) {}
 
-      // Fetch recent events from ntfy.sh cloud history (24h window) without wiping local data
+      // Fetch recent events from ntfy.sh cloud history (24h window) and reconcile
       try {
-        const res = await fetch(`https://ntfy.sh/${liveSocket.cloudTopic}/json?poll=1&since=24h`);
+        const res = await fetch(`https://ntfy.sh/${liveSocket.cloudTopic}/json?poll=1&since=24h&_t=${Date.now()}`, {
+          cache: 'no-store'
+        });
         const text = await res.text();
         const lines = text.trim().split('\n').filter(Boolean);
         lines.forEach(line => {
@@ -349,19 +498,16 @@
               const msg = JSON.parse(evt.message);
               if (msg.type === 'RECORD_UPDATED' && msg.record) {
                 const r = msg.record;
-                if (!state.records[r.serverId]) state.records[r.serverId] = {};
-                const existing = state.records[r.serverId][r.bossId];
-                if (!existing || (r.updatedAt || 0) >= (existing.updatedAt || 0)) {
-                  state.records[r.serverId][r.bossId] = r;
-                }
-                if (!msg.isAutoAdjust && msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+                reconcileRecordsState({ [r.serverId]: { [r.bossId]: r } }, msg.deletedRecords, msg.lastResetAllAt);
+                if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
                   state.lastActivityAt = msg.lastActivityAt;
                 }
                 if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
                   state.logs.unshift(msg.log);
                 }
               } else if (msg.type === 'RECORD_CLEARED') {
-                if (state.records[msg.serverId]) delete state.records[msg.serverId][msg.bossId];
+                const delTs = msg.deletedAt || (msg.log && msg.log.timestamp) || evt.time * 1000 || Date.now();
+                reconcileRecordsState(null, { [`${msg.serverId}_${msg.bossId}`]: delTs }, msg.lastResetAllAt);
                 if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
                   state.lastActivityAt = msg.lastActivityAt;
                 }
@@ -369,13 +515,22 @@
                   state.logs.unshift(msg.log);
                 }
               } else if (msg.type === 'ALL_RECORDS_RESET') {
-                state.records = {};
+                const resetTs = msg.lastResetAllAt || (msg.log && msg.log.timestamp) || evt.time * 1000 || Date.now();
+                reconcileRecordsState(null, null, resetTs);
                 if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
                   state.lastActivityAt = msg.lastActivityAt;
                 }
                 if (msg.log && !state.logs.some(l => l.id === msg.log.id)) {
                   state.logs.unshift(msg.log);
                 }
+              } else if (msg.type === 'STATE_SNAPSHOT') {
+                if (msg.config && msg.config.bosses) {
+                  state.config.bosses = mergeBossesNonDestructive(state.config.bosses, msg.config.bosses);
+                }
+                if (msg.lastActivityAt && msg.lastActivityAt > state.lastActivityAt) {
+                  state.lastActivityAt = msg.lastActivityAt;
+                }
+                reconcileRecordsState(msg.records, msg.deletedRecords, msg.lastResetAllAt);
               } else if (msg.type === 'CHAT_MESSAGE' && msg.chat) {
                 if (!state.chats.some(c => c.id === msg.chat.id)) {
                   state.chats.push(msg.chat);
@@ -386,7 +541,9 @@
             }
           } catch (e) {}
         });
+        reconcileRecordsState();
         pruneOldChatsInState();
+        state.logs.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
         saveLocalCloudCache();
       } catch (e) {}
 
@@ -394,6 +551,8 @@
         success: true,
         config: state.config,
         records: state.records,
+        deletedRecords: state.deletedRecords,
+        lastResetAllAt: state.lastResetAllAt,
         logs: state.logs.slice(0, 100),
         chats: state.chats,
         lastActivityAt: state.lastActivityAt
@@ -401,45 +560,44 @@
     }
 
     if (endpoint === '/api/record') {
-      const { serverId, bossId, killedAt, respawnMinutes, note, isAutoAdjust } = body;
-      const kTime = killedAt ? Number(killedAt) : Date.now();
+      const { serverId, bossId, killedAt, respawnMinutes, note } = body;
+      const now = Date.now();
+      const kTime = killedAt ? Number(killedAt) : now;
       const rMinutes = Number(respawnMinutes) > 0 ? Number(respawnMinutes) : 45;
       const respawnAt = kTime + rMinutes * 60 * 1000;
       const bossDef = state.config.bosses.find(b => b.id === bossId) || { name: bossId };
-      const reporter = isAutoAdjust ? '系統自動(重生15分轉倒數30分)' : state.currentUser;
 
       const recordEntry = {
         serverId,
         bossId,
         bossName: bossDef.name,
+        baseKilledAt: kTime,
+        baseRespawnMinutes: rMinutes,
         killedAt: kTime,
         respawnMinutes: rMinutes,
         respawnAt,
-        reporter,
+        reporter: state.currentUser,
         note: note || '',
-        autoAdjusted30m: Boolean(isAutoAdjust),
-        updatedAt: Date.now()
+        updatedAt: now
       };
 
       if (!state.records[serverId]) state.records[serverId] = {};
       state.records[serverId][bossId] = recordEntry;
-
-      if (!isAutoAdjust) {
-        state.lastActivityAt = Date.now();
-      }
+      delete state.deletedRecords[`${serverId}_${bossId}`];
+      state.lastActivityAt = now;
 
       const logEntry = {
-        id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-        type: isAutoAdjust ? 'AUTO_30M' : 'KILL',
+        id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
+        type: 'KILL',
         serverId,
         bossId,
         bossName: bossDef.name,
         killedAt: kTime,
         respawnAt,
         respawnMinutes: rMinutes,
-        reporter,
+        reporter: state.currentUser,
         note: note || '',
-        timestamp: Date.now()
+        timestamp: now
       };
       state.logs.unshift(logEntry);
       if (state.logs.length > 200) state.logs.pop();
@@ -448,28 +606,35 @@
       liveSocket.broadcastCloud({
         type: 'RECORD_UPDATED',
         record: recordEntry,
+        deletedRecords: state.deletedRecords,
+        lastResetAllAt: state.lastResetAllAt,
         log: logEntry,
-        lastActivityAt: state.lastActivityAt,
-        isAutoAdjust: Boolean(isAutoAdjust)
+        lastActivityAt: state.lastActivityAt
       });
 
       return { success: true, record: recordEntry, lastActivityAt: state.lastActivityAt };
     }
 
     if (endpoint === '/api/record/clear') {
-      const { serverId, bossId } = body;
+      const { serverId, bossId, isAutoDelete3R } = body;
+      const now = Date.now();
       const bossDef = state.config.bosses.find(b => b.id === bossId) || { name: bossId };
+      const reporter = isAutoDelete3R ? '系統自動(滿三輪未編輯刪除)' : state.currentUser;
+
       if (state.records[serverId]) delete state.records[serverId][bossId];
-      state.lastActivityAt = Date.now();
+      state.deletedRecords[`${serverId}_${bossId}`] = now;
+      if (!isAutoDelete3R) {
+        state.lastActivityAt = now;
+      }
 
       const logEntry = {
-        id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-        type: 'CLEAR',
+        id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
+        type: isAutoDelete3R ? 'AUTO_DEL_3R' : 'CLEAR',
         serverId,
         bossId,
         bossName: bossDef.name,
-        reporter: state.currentUser,
-        timestamp: Date.now()
+        reporter,
+        timestamp: now
       };
       state.logs.unshift(logEntry);
       saveLocalCloudCache();
@@ -479,27 +644,33 @@
         serverId,
         bossId,
         bossName: bossDef.name,
-        reporter: state.currentUser,
+        reporter,
+        deletedAt: now,
+        deletedRecords: state.deletedRecords,
+        lastResetAllAt: state.lastResetAllAt,
         lastActivityAt: state.lastActivityAt,
-        log: logEntry
+        log: logEntry,
+        isAutoDelete3R: Boolean(isAutoDelete3R)
       });
 
-      return { success: true, lastActivityAt: state.lastActivityAt };
+      return { success: true, lastActivityAt: state.lastActivityAt, deletedAt: now };
     }
 
     if (endpoint === '/api/record/reset-all') {
       const { isAuto } = body;
+      const now = Date.now();
       state.records = {};
-      state.lastActivityAt = Date.now();
+      state.lastResetAllAt = now;
+      state.lastActivityAt = now;
 
       const logEntry = {
-        id: `${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        id: `${now}_${Math.random().toString(36).substr(2, 4)}`,
         type: isAuto ? 'AUTO_RESET_3H' : 'CLEAR',
         serverId: 'ALL',
         bossId: 'ALL',
         bossName: '全頻道',
         reporter: isAuto ? '系統自動(閒置3小時重置)' : state.currentUser,
-        timestamp: Date.now()
+        timestamp: now
       };
       state.logs.unshift(logEntry);
       saveLocalCloudCache();
@@ -507,10 +678,11 @@
       liveSocket.broadcastCloud({
         type: 'ALL_RECORDS_RESET',
         lastActivityAt: state.lastActivityAt,
+        lastResetAllAt: state.lastResetAllAt,
         log: logEntry
       });
 
-      return { success: true, lastActivityAt: state.lastActivityAt };
+      return { success: true, lastActivityAt: state.lastActivityAt, lastResetAllAt: state.lastResetAllAt };
     }
 
     if (endpoint === '/api/chat') {
@@ -573,6 +745,71 @@
     }
 
     return { success: true };
+  }
+
+  // Manual & Background Synchronization Function
+  async function syncNow(showUserFeedback = false) {
+    if (!state.currentUser || state.isSyncing) return;
+    state.isSyncing = true;
+
+    if (showUserFeedback) {
+      if (el.btnManualSync) el.btnManualSync.textContent = '🔄 同步中...';
+      if (el.btnListSync) el.btnListSync.textContent = '同步中...';
+    }
+
+    try {
+      const data = await apiFetch('/api/state');
+      if (data.success) {
+        if (data.config && data.config.bosses) {
+          state.config.bosses = mergeBossesNonDestructive(state.config.bosses, data.config.bosses);
+        }
+        reconcileRecordsState(data.records, data.deletedRecords, data.lastResetAllAt);
+        if (data.lastActivityAt && data.lastActivityAt > state.lastActivityAt) {
+          state.lastActivityAt = data.lastActivityAt;
+        }
+        if (data.chats) {
+          data.chats.forEach(c => {
+            if (!state.chats.some(existing => existing.id === c.id)) {
+              state.chats.push(c);
+            }
+          });
+          pruneOldChatsInState();
+        }
+        saveLocalCloudCache();
+
+        // Also broadcast our reconciled snapshot so the other teammate immediately receives any missing records
+        if (isGitHubPages && showUserFeedback) {
+          await liveSocket.broadcastCloud({
+            type: 'STATE_SNAPSHOT',
+            config: state.config,
+            records: state.records,
+            deletedRecords: state.deletedRecords,
+            lastResetAllAt: state.lastResetAllAt,
+            lastActivityAt: state.lastActivityAt
+          });
+        }
+
+        // Reconnect socket if disconnected
+        if (!liveSocket.isConnected) {
+          liveSocket.connect();
+        }
+
+        refreshAllViews();
+        renderChatMessages();
+
+        if (showUserFeedback) {
+          showToast('✅ 已與隊友完成最新資料同步！', 'success');
+        }
+      }
+    } catch (e) {
+      if (showUserFeedback) {
+        showToast('同步失敗：' + e.message, 'error');
+      }
+    } finally {
+      state.isSyncing = false;
+      if (el.btnManualSync) el.btnManualSync.textContent = '🔄 立即同步';
+      if (el.btnListSync) el.btnListSync.textContent = '🔄 同步';
+    }
   }
 
   // Authentication Flow
@@ -657,7 +894,7 @@
       const data = await apiFetch('/api/state');
       if (data.success) {
         state.config = data.config;
-        state.records = data.records || {};
+        reconcileRecordsState(data.records, data.deletedRecords, data.lastResetAllAt);
         state.logs = data.logs || [];
         state.chats = data.chats || [];
         if (data.lastActivityAt) {
@@ -666,15 +903,19 @@
         pruneOldChatsInState();
         saveLocalCloudCache();
 
-        // Pre-seed alertedCache for bosses that already spawned > 1 minute ago
         const now = Date.now();
         state.config.servers.forEach(srv => {
           const srvRecs = state.records[srv] || {};
           Object.values(srvRecs).forEach(rec => {
-            if (rec && rec.respawnAt && rec.respawnAt - now < -60000) {
-              state.alertedCache.add(`${srv}_${rec.bossId}_${rec.respawnAt}_0m`);
-              state.alertedCache.add(`${srv}_${rec.bossId}_${rec.respawnAt}_1m`);
-              state.alertedCache.add(`${srv}_${rec.bossId}_${rec.respawnAt}_thresh`);
+            if (!rec) return;
+            const cycle = computeRecordCycle(rec, now);
+            if (!cycle.expired) {
+              state.notifiedRoundCache.add(`${srv}_${rec.bossId}_${rec.baseKilledAt || rec.killedAt}_r${cycle.round}`);
+              if (cycle.diffMs < -60000) {
+                state.alertedCache.add(`${srv}_${rec.bossId}_${cycle.phaseRespawnAt}_0m`);
+                state.alertedCache.add(`${srv}_${rec.bossId}_${cycle.phaseRespawnAt}_1m`);
+                state.alertedCache.add(`${srv}_${rec.bossId}_${cycle.phaseRespawnAt}_thresh`);
+              }
             }
           });
         });
@@ -685,6 +926,12 @@
         selectBoss(state.activeBossId);
         renderChatMessages();
         startCountdownTicker();
+
+        // Background auto-sync every 15 seconds so 2 users stay in sync even if WS drops
+        if (state.autoSyncId) clearInterval(state.autoSyncId);
+        state.autoSyncId = setInterval(() => {
+          syncNow(false);
+        }, 15000);
 
         if ('Notification' in window && Notification.permission === 'default') {
           Notification.requestPermission();
@@ -855,7 +1102,7 @@
     renderSingleBossServerList();
   }
 
-  // Update dots & mini timers on S1~S60 ONLY for the currently selected Boss
+  // Update dots & mini timers on S1~S60 ONLY for the currently selected Boss (with Round 2 / Round 3 colors)
   function renderServerGridBadges() {
     const now = Date.now();
     const activeBoss = getActiveBoss();
@@ -864,7 +1111,9 @@
     state.config.servers.forEach(srv => {
       const srvRecs = state.records[srv] || {};
       Object.values(srvRecs).forEach(r => {
-        if (r && r.respawnAt && (r.respawnAt - now) <= state.alertThresholdMinutes * 60 * 1000) {
+        if (!r) return;
+        const c = computeRecordCycle(r, now);
+        if (!c.expired && c.diffMs <= state.alertThresholdMinutes * 60 * 1000) {
           totalRadarCount++;
         }
       });
@@ -880,29 +1129,51 @@
       const dot = btn.querySelector('.server-badge-dot');
       const miniTimer = btn.querySelector('.server-mini-timer');
 
-      if (rec && rec.respawnAt) {
-        const diffMs = rec.respawnAt - now;
-        if (diffMs <= 0) {
-          dot.className = 'server-badge-dot alive';
-          dot.style.display = 'block';
-          miniTimer.textContent = '已重生';
-          miniTimer.className = 'server-mini-timer alive';
-        } else if (diffMs <= state.alertThresholdMinutes * 60 * 1000) {
-          dot.className = 'server-badge-dot soon';
-          dot.style.display = 'block';
-          miniTimer.textContent = formatShortDuration(Math.ceil(diffMs / 1000));
-          miniTimer.className = 'server-mini-timer soon';
-        } else {
-          dot.style.display = 'none';
-          miniTimer.textContent = formatShortDuration(Math.ceil(diffMs / 1000));
-          miniTimer.className = 'server-mini-timer counting';
+      if (rec) {
+        const cycle = computeRecordCycle(rec, now);
+        if (!cycle.expired) {
+          const diffMs = cycle.diffMs;
+          const rPrefix = cycle.round === 2 ? 'R2 ' : (cycle.round === 3 ? 'R3 ' : '');
+
+          if (diffMs <= 0) {
+            dot.className = `server-badge-dot ${cycle.round === 3 ? 'round-3' : (cycle.round === 2 ? 'round-2' : 'alive')}`;
+            dot.style.display = 'block';
+            miniTimer.textContent = `${rPrefix}已重生`;
+            miniTimer.className = `server-mini-timer ${cycle.round === 3 ? 'round-3' : (cycle.round === 2 ? 'round-2' : 'alive')}`;
+          } else if (diffMs <= state.alertThresholdMinutes * 60 * 1000) {
+            dot.className = 'server-badge-dot soon';
+            dot.style.display = 'block';
+            miniTimer.textContent = `${rPrefix}${formatShortDuration(Math.ceil(diffMs / 1000))}`;
+            miniTimer.className = 'server-mini-timer soon';
+          } else {
+            if (cycle.round >= 2) {
+              dot.className = `server-badge-dot round-${cycle.round}`;
+              dot.style.display = 'block';
+            } else {
+              dot.style.display = 'none';
+            }
+            miniTimer.textContent = `${rPrefix}${formatShortDuration(Math.ceil(diffMs / 1000))}`;
+            miniTimer.className = `server-mini-timer ${cycle.round === 3 ? 'round-3' : (cycle.round === 2 ? 'round-2' : 'counting')}`;
+          }
+          return;
         }
-      } else {
-        dot.style.display = 'none';
-        miniTimer.textContent = '';
-        miniTimer.className = 'server-mini-timer';
       }
+
+      dot.style.display = 'none';
+      miniTimer.textContent = '';
+      miniTimer.className = 'server-mini-timer';
     });
+  }
+
+  // Helper to build Round Badge HTML
+  function getRoundTagHtml(round) {
+    if (round === 2) {
+      return '<span class="round-tag r2">🟣 第二輪 (自動倒數30分)</span>';
+    }
+    if (round === 3) {
+      return '<span class="round-tag r3">🟠 第三輪・最終輪 (未編輯將自動刪除)</span>';
+    }
+    return '<span class="round-tag r1">🔵 第一輪 (手動記錄)</span>';
   }
 
   // STEP 3: Render ONLY the Single Selected Boss Card for the Selected Server
@@ -921,7 +1192,8 @@
     const now = Date.now();
     const serverRecords = state.records[state.activeServer] || {};
     const rec = serverRecords[boss.id];
-    const currentRespawnMins = rec ? rec.respawnMinutes : boss.respawnMinutes;
+    const cycle = rec ? computeRecordCycle(rec, now) : { expired: true };
+    const hasValidRec = rec && !cycle.expired;
 
     let statusClass = '';
     let badgeHtml = '';
@@ -931,52 +1203,114 @@
     let progressClass = '';
     let detailsHtml = '';
 
-    if (rec && rec.respawnAt) {
-      const diffMs = rec.respawnAt - now;
-      const totalDuration = Math.max(1000, rec.respawnAt - rec.killedAt);
-      const elapsed = now - rec.killedAt;
+    if (hasValidRec) {
+      const diffMs = cycle.diffMs;
+      const totalDuration = Math.max(1000, cycle.phaseRespawnAt - cycle.phaseStartAt);
+      const elapsed = now - cycle.phaseStartAt;
       progressPercent = Math.min(100, Math.max(0, (elapsed / totalDuration) * 100));
 
-      const killedTimeStr = formatTime(new Date(rec.killedAt));
-      const respawnTimeStr = formatTime(new Date(rec.respawnAt));
-      const auto30Tag = rec.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 重生15分未編輯已改為倒數30分</span>' : '';
+      const phaseStartStr = formatTime(new Date(cycle.phaseStartAt));
+      const respawnTimeStr = formatTime(new Date(cycle.phaseRespawnAt));
+      const roundTag = getRoundTagHtml(cycle.round);
+
+      if (cycle.round === 2) statusClass = 'status-round-2';
+      if (cycle.round === 3) statusClass = 'status-round-3';
 
       if (diffMs <= 0) {
-        statusClass = 'status-alive';
-        badgeHtml = '<span class="boss-status-badge badge-alive">🟢 已重生 / 存活中</span>';
-        countdownClass = 'alive';
-        progressClass = 'ready';
-        progressPercent = 100;
+        if (cycle.round === 1) statusClass = 'status-alive';
         const overdueSeconds = Math.floor(Math.abs(diffMs) / 1000);
+        const remainToNextRoundSec = Math.max(0, Math.ceil((cycle.nextTransitionAt - now) / 1000));
+
+        if (cycle.round === 1) {
+          badgeHtml = '<span class="boss-status-badge badge-alive">🟢 第一輪・已重生</span>';
+          countdownClass = 'alive';
+          progressClass = 'ready';
+        } else if (cycle.round === 2) {
+          badgeHtml = '<span class="boss-status-badge badge-round-2">🟣 第二輪・已重生</span>';
+          countdownClass = 'round-2';
+          progressClass = 'round-2';
+        } else {
+          badgeHtml = '<span class="boss-status-badge badge-round-3">🟠 第三輪・已重生 (即將刪除)</span>';
+          countdownClass = 'round-3';
+          progressClass = 'round-3';
+        }
+        progressPercent = 100;
         countdownHtml = `已重生 +${formatDuration(overdueSeconds)}`;
+
+        const nextActionHint = cycle.round < 3
+          ? `若無人編輯，將於 ${formatShortDuration(remainToNextRoundSec)} 後自動進入「第 ${cycle.round + 1} 輪 (倒數30分)」`
+          : `⚠️ 此為第三輪，若無人手動編輯將於 ${formatShortDuration(remainToNextRoundSec)} 後自動刪除此頻道紀錄！`;
+
+        detailsHtml = `
+          <div class="detail-row">
+            <span>目前階段：</span>
+            <span class="detail-highlight">${roundTag}</span>
+          </div>
+          <div class="detail-row">
+            <span>本輪預計復活：</span>
+            <span class="detail-highlight" style="color: var(--accent-cyan); font-weight: 700;">${respawnTimeStr}</span>
+          </div>
+          <div class="detail-row">
+            <span>自動轉換提示：</span>
+            <span class="detail-highlight" style="color: ${cycle.round === 3 ? '#fb923c' : '#c084fc'};">${nextActionHint}</span>
+          </div>
+          ${rec.note ? `<div class="detail-row"><span>備註：</span><span class="detail-highlight">${escapeHtml(rec.note)}</span></div>` : ''}
+        `;
       } else if (diffMs <= state.alertThresholdMinutes * 60 * 1000) {
         statusClass = 'status-spawning-soon';
         const mins = Math.ceil(diffMs / 60000);
-        badgeHtml = `<span class="boss-status-badge badge-soon">⚠️ 即將復活 (${mins}分鐘內)</span>`;
+        badgeHtml = `<span class="boss-status-badge badge-soon">⚠️ 第${cycle.round}輪・即將復活 (${mins}分內)</span>`;
         countdownClass = 'soon';
         progressClass = 'soon';
         countdownHtml = formatDuration(Math.ceil(diffMs / 1000));
-      } else {
-        badgeHtml = '<span class="boss-status-badge badge-respawning">🔴 復活倒數中</span>';
-        countdownClass = 'counting';
-        countdownHtml = formatDuration(Math.ceil(diffMs / 1000));
-      }
 
-      detailsHtml = `
-        <div class="detail-row">
-          <span>基準時間：</span>
-          <span class="detail-highlight">${killedTimeStr} (${rec.reporter || '未知'}) ${auto30Tag}</span>
-        </div>
-        <div class="detail-row">
-          <span>預計復活時間：</span>
-          <span class="detail-highlight" style="color: var(--accent-cyan); font-weight: 700;">${respawnTimeStr}</span>
-        </div>
-        <div class="detail-row">
-          <span>目前設定間隔：</span>
-          <span class="detail-highlight">${formatMinutes(rec.respawnMinutes)}</span>
-        </div>
-        ${rec.note ? `<div class="detail-row"><span>備註：</span><span class="detail-highlight">${rec.note}</span></div>` : ''}
-      `;
+        detailsHtml = `
+          <div class="detail-row">
+            <span>目前階段：</span>
+            <span class="detail-highlight">${roundTag}</span>
+          </div>
+          <div class="detail-row">
+            <span>預計復活時間：</span>
+            <span class="detail-highlight" style="color: var(--accent-yellow); font-weight: 700;">${respawnTimeStr}</span>
+          </div>
+          <div class="detail-row">
+            <span>本輪起算時間：</span>
+            <span class="detail-highlight">${phaseStartStr} (${rec.reporter || '未知'})</span>
+          </div>
+          ${rec.note ? `<div class="detail-row"><span>備註：</span><span class="detail-highlight">${escapeHtml(rec.note)}</span></div>` : ''}
+        `;
+      } else {
+        if (cycle.round === 2) {
+          badgeHtml = '<span class="boss-status-badge badge-round-2">🟣 第二輪・倒數 30 分鐘</span>';
+          countdownClass = 'round-2';
+          progressClass = 'round-2';
+        } else if (cycle.round === 3) {
+          badgeHtml = '<span class="boss-status-badge badge-round-3">🟠 第三輪(最終)・倒數 30 分鐘</span>';
+          countdownClass = 'round-3';
+          progressClass = 'round-3';
+        } else {
+          badgeHtml = '<span class="boss-status-badge badge-respawning">🔴 第一輪・復活倒數中</span>';
+          countdownClass = 'counting';
+          progressClass = '';
+        }
+        countdownHtml = formatDuration(Math.ceil(diffMs / 1000));
+
+        detailsHtml = `
+          <div class="detail-row">
+            <span>目前階段：</span>
+            <span class="detail-highlight">${roundTag}</span>
+          </div>
+          <div class="detail-row">
+            <span>預計復活時間：</span>
+            <span class="detail-highlight" style="color: var(--accent-cyan); font-weight: 700;">${respawnTimeStr}</span>
+          </div>
+          <div class="detail-row">
+            <span>本輪起算時間：</span>
+            <span class="detail-highlight">${phaseStartStr} (原始回報: ${rec.reporter || '未知'})</span>
+          </div>
+          ${rec.note ? `<div class="detail-row"><span>備註：</span><span class="detail-highlight">${escapeHtml(rec.note)}</span></div>` : ''}
+        `;
+      }
     } else {
       badgeHtml = '<span class="boss-status-badge" style="background: rgba(255,255,255,0.06); color: var(--text-muted);">⚪ 此伺服器尚未記錄</span>';
       countdownHtml = '--:--:--';
@@ -987,11 +1321,11 @@
         </div>
         <div class="detail-row">
           <span>預設復活時間：</span>
-          <span class="detail-highlight">${formatMinutes(currentRespawnMins)}</span>
+          <span class="detail-highlight">${formatMinutes(boss.respawnMinutes)}</span>
         </div>
         <div class="detail-row">
           <span>狀態：</span>
-          <span class="detail-highlight">尚未輸入打死時間</span>
+          <span class="detail-highlight">尚未輸入打死時間（或已滿三輪未編輯自動刪除）</span>
         </div>
       `;
     }
@@ -1001,6 +1335,10 @@
     const card = document.createElement('div');
     card.className = `boss-card ${statusClass}`;
     card.id = 'singleActiveBossCard';
+    card.dataset.renderedRound = hasValidRec ? String(cycle.round) : '0';
+    card.dataset.renderedAlive = hasValidRec ? String(cycle.diffMs <= 0) : 'false';
+    card.dataset.renderedSoon = hasValidRec ? String(cycle.diffMs > 0 && cycle.diffMs <= state.alertThresholdMinutes * 60 * 1000) : 'false';
+
     card.innerHTML = `
       <div>
         <div class="boss-card-header">
@@ -1011,7 +1349,7 @@
               <span>${boss.name}</span>
             </div>
             <div class="boss-meta-tags">
-              <span class="meta-tag">復活週期: ${formatMinutes(currentRespawnMins)}</span>
+              <span class="meta-tag">預設週期: ${formatMinutes(boss.respawnMinutes)}</span>
               ${boss.location ? `<span class="meta-tag">📍 ${boss.location}</span>` : ''}
             </div>
           </div>
@@ -1034,9 +1372,9 @@
         <!-- Quick 1-Click Kill Button -->
         <div style="display: flex; gap: 10px; margin-bottom: 18px;">
           <button type="button" class="btn-record-kill" id="btnSingleQuickKill" style="flex: 1; padding: 12px; font-size: 1.05rem;">
-            ⚡ 剛剛打死 [${state.activeServer}] ${boss.name}（立即倒數 ${formatMinutes(boss.respawnMinutes)}）
+            ⚡ 剛剛打死 [${state.activeServer}] ${boss.name}（重置為第一輪倒數 ${formatMinutes(boss.respawnMinutes)}）
           </button>
-          ${rec ? `<button type="button" class="btn btn-danger" id="btnSingleClearKill" title="清除此服紀錄">🔄 清除紀錄</button>` : ''}
+          ${hasValidRec ? `<button type="button" class="btn btn-danger" id="btnSingleClearKill" title="清除此服紀錄">🔄 清除紀錄</button>` : ''}
         </div>
 
         <!-- Custom Kill Time & Respawn Interval Form directly inside the single boss card -->
@@ -1092,7 +1430,7 @@
     const inputNote = card.querySelector('#singleInputNote');
 
     card.querySelector('#btnSingleQuickKill').addEventListener('click', () => {
-      saveBossRecord(state.activeServer, boss.id, Date.now(), boss.respawnMinutes, inputNote.value.trim(), false);
+      saveBossRecord(state.activeServer, boss.id, Date.now(), boss.respawnMinutes, inputNote.value.trim());
     });
 
     const btnClear = card.querySelector('#btnSingleClearKill');
@@ -1125,7 +1463,7 @@
         alert('請輸入大於 0 的復活時間分鐘數！');
         return;
       }
-      saveBossRecord(state.activeServer, boss.id, killedAt, mins, inputNote.value.trim(), false);
+      saveBossRecord(state.activeServer, boss.id, killedAt, mins, inputNote.value.trim());
     });
 
     el.singleBossContainer.appendChild(card);
@@ -1141,17 +1479,25 @@
     const now = Date.now();
     const serverRecords = state.records[state.activeServer] || {};
     const rec = serverRecords[boss.id];
+    if (!rec) {
+      if (card.dataset.renderedRound !== '0') renderSingleBossView();
+      return;
+    }
 
-    if (!rec || !rec.respawnAt) return;
+    const cycle = computeRecordCycle(rec, now);
+    if (cycle.expired) {
+      renderSingleBossView();
+      return;
+    }
 
-    const diffMs = rec.respawnAt - now;
-    const isAlive = diffMs <= 0;
-    const isSoon = diffMs > 0 && diffMs <= state.alertThresholdMinutes * 60 * 1000;
+    const isAlive = cycle.diffMs <= 0;
+    const isSoon = cycle.diffMs > 0 && cycle.diffMs <= state.alertThresholdMinutes * 60 * 1000;
 
-    const wasAlive = card.classList.contains('status-alive');
-    const wasSoon = card.classList.contains('status-spawning-soon');
-
-    if (isAlive !== wasAlive || isSoon !== wasSoon) {
+    if (
+      card.dataset.renderedRound !== String(cycle.round) ||
+      card.dataset.renderedAlive !== String(isAlive) ||
+      card.dataset.renderedSoon !== String(isSoon)
+    ) {
       renderSingleBossView();
       return;
     }
@@ -1161,17 +1507,17 @@
 
     if (countdownEl) {
       if (isAlive) {
-        const overdueSeconds = Math.floor(Math.abs(diffMs) / 1000);
+        const overdueSeconds = Math.floor(Math.abs(cycle.diffMs) / 1000);
         countdownEl.textContent = `已重生 +${formatDuration(overdueSeconds)}`;
       } else {
-        const remainSeconds = Math.ceil(diffMs / 1000);
+        const remainSeconds = Math.ceil(cycle.diffMs / 1000);
         countdownEl.textContent = formatDuration(remainSeconds);
       }
     }
 
     if (progressEl) {
-      const totalDuration = Math.max(1000, rec.respawnAt - rec.killedAt);
-      const elapsed = now - rec.killedAt;
+      const totalDuration = Math.max(1000, cycle.phaseRespawnAt - cycle.phaseStartAt);
+      const elapsed = now - cycle.phaseStartAt;
       const progressPercent = isAlive ? 100 : Math.min(100, Math.max(0, (elapsed / totalDuration) * 100));
       progressEl.style.width = `${progressPercent}%`;
     }
@@ -1189,15 +1535,18 @@
     state.config.servers.forEach(srv => {
       const srvRecs = state.records[srv] || {};
       const rec = srvRecs[boss.id];
-      if (rec && rec.respawnAt) {
-        activeItems.push({
-          ...rec,
-          diffMs: rec.respawnAt - now
-        });
+      if (rec) {
+        const cycle = computeRecordCycle(rec, now);
+        if (!cycle.expired) {
+          activeItems.push({
+            ...rec,
+            cycle
+          });
+        }
       }
     });
 
-    activeItems.sort((a, b) => a.diffMs - b.diffMs);
+    activeItems.sort((a, b) => a.cycle.diffMs - b.cycle.diffMs);
     el.lblActiveBossServerCount.textContent = `${activeItems.length} 個頻道`;
 
     if (activeItems.length === 0) {
@@ -1211,31 +1560,41 @@
     }
 
     activeItems.forEach(item => {
+      const { cycle } = item;
       const row = document.createElement('div');
-      const isAlive = item.diffMs <= 0;
-      const isSoon = item.diffMs > 0 && item.diffMs <= state.alertThresholdMinutes * 60 * 1000;
-      const sec = Math.ceil(Math.abs(item.diffMs) / 1000);
+      const isAlive = cycle.diffMs <= 0;
+      const isSoon = cycle.diffMs > 0 && cycle.diffMs <= state.alertThresholdMinutes * 60 * 1000;
+      const sec = Math.ceil(Math.abs(cycle.diffMs) / 1000);
 
-      const timerColor = isAlive
-        ? 'var(--accent-green)'
-        : (isSoon ? 'var(--accent-yellow)' : 'var(--accent-cyan)');
+      let timerColor = 'var(--accent-cyan)';
+      if (isAlive) {
+        timerColor = cycle.round === 3 ? '#fb923c' : (cycle.round === 2 ? '#c084fc' : 'var(--accent-green)');
+      } else if (isSoon) {
+        timerColor = 'var(--accent-yellow)';
+      } else if (cycle.round === 2) {
+        timerColor = '#c084fc';
+      } else if (cycle.round === 3) {
+        timerColor = '#fb923c';
+      }
 
       const timerStr = isAlive
         ? `已重生 +${formatDuration(sec)}`
         : formatDuration(sec);
 
-      const auto30Badge = item.autoAdjusted30m ? '<span class="auto-30m-badge">⚡ 重生15分轉30分</span>' : '';
+      const roundBadge = getRoundTagHtml(cycle.round);
+      const rowRoundClass = cycle.round === 2 ? 'row-round-2' : (cycle.round === 3 ? 'row-round-3' : '');
 
-      row.className = `srv-summary-row ${item.serverId === state.activeServer ? 'active-srv' : ''}`;
+      row.className = `srv-summary-row ${rowRoundClass} ${item.serverId === state.activeServer ? 'active-srv' : ''}`;
       row.innerHTML = `
         <div style="display: flex; align-items: center; gap: 10px;">
           <span class="radar-server-tag" style="min-width: 36px;">${item.serverId}</span>
           <div>
-            <div style="font-family: var(--font-mono); font-weight: 800; font-size: 1rem; color: ${timerColor};">
-              ${timerStr} ${auto30Badge}
+            <div style="font-family: var(--font-mono); font-weight: 800; font-size: 1rem; color: ${timerColor}; display: flex; align-items: center; flex-wrap: wrap;">
+              <span>${timerStr}</span>
+              ${roundBadge}
             </div>
-            <div style="font-size: 0.74rem; color: var(--text-secondary);">
-              預計 ${formatTime(new Date(item.respawnAt))} 復活 · 記錄 ${formatTime(new Date(item.killedAt))}
+            <div style="font-size: 0.74rem; color: var(--text-secondary); margin-top: 2px;">
+              預計 ${formatTime(new Date(cycle.phaseRespawnAt))} 復活 · 起算 ${formatTime(new Date(cycle.phaseStartAt))} (${item.reporter || '未知'})
             </div>
           </div>
         </div>
@@ -1258,8 +1617,8 @@
     });
   }
 
-  // Save Boss Kill Record
-  async function saveBossRecord(serverId, bossId, killedAt, respawnMinutes, note, isAutoAdjust = false) {
+  // Save Boss Kill Record (Manual)
+  async function saveBossRecord(serverId, bossId, killedAt, respawnMinutes, note) {
     try {
       const res = await apiFetch('/api/record', {
         method: 'POST',
@@ -1268,58 +1627,54 @@
           bossId,
           killedAt,
           respawnMinutes,
-          note,
-          isAutoAdjust
+          note
         })
       });
 
       if (res.success) {
-        if (!isAutoAdjust) {
-          showToast(`✅ 已記錄 [${serverId}] ${res.record.bossName} 打死時間，開始倒數 ${formatMinutes(respawnMinutes)}！`, 'success');
-        } else {
-          showToast(`⚡ [${serverId}] ${res.record.bossName} 重生後 15 分鐘未編輯，已自動改為倒數 30 分鐘！`, 'warn');
-        }
+        showToast(`✅ 已記錄 [${serverId}] ${res.record.bossName} 打死時間，開始第一輪倒數 ${formatMinutes(respawnMinutes)}！`, 'success');
         if (!state.records[serverId]) state.records[serverId] = {};
         state.records[serverId][bossId] = res.record;
+        delete state.deletedRecords[`${serverId}_${bossId}`];
         if (res.lastActivityAt) state.lastActivityAt = res.lastActivityAt;
         saveLocalCloudCache();
-        renderTopBossTabs();
-        renderServerGridBadges();
-        renderSingleBossView();
-        renderSingleBossServerList();
+        refreshAllViews();
       }
     } catch (e) {
-      if (!isAutoAdjust) showToast('紀錄失敗：' + e.message, 'error');
+      showToast('紀錄失敗：' + e.message, 'error');
     }
   }
 
-  // Clear Boss Record
-  async function clearBossRecord(serverId, bossId, bossName) {
-    if (!confirm(`確定要清除 [${serverId}] ${bossName} 的時間紀錄嗎？`)) return;
+  // Clear Boss Record (Manual or 3-Round Auto Delete)
+  async function clearBossRecord(serverId, bossId, bossName, isAutoDelete3R = false) {
+    if (!isAutoDelete3R && !confirm(`確定要清除 [${serverId}] ${bossName} 的時間紀錄嗎？`)) return;
 
     try {
       const res = await apiFetch('/api/record/clear', {
         method: 'POST',
         body: JSON.stringify({
           serverId,
-          bossId
+          bossId,
+          isAutoDelete3R
         })
       });
 
       if (res.success) {
-        showToast(`已重設 [${serverId}] ${bossName} 紀錄`, 'info');
+        if (isAutoDelete3R) {
+          showToast(`🗑️ [${serverId}] ${bossName} 已連續三輪無手動編輯，系統已自動刪除紀錄（請重新找王時間）！`, 'warn');
+        } else {
+          showToast(`已重設 [${serverId}] ${bossName} 紀錄`, 'info');
+        }
         if (state.records[serverId]) {
           delete state.records[serverId][bossId];
         }
+        state.deletedRecords[`${serverId}_${bossId}`] = res.deletedAt || Date.now();
         if (res.lastActivityAt) state.lastActivityAt = res.lastActivityAt;
         saveLocalCloudCache();
-        renderTopBossTabs();
-        renderServerGridBadges();
-        renderSingleBossView();
-        renderSingleBossServerList();
+        refreshAllViews();
       }
     } catch (e) {
-      showToast('清除失敗：' + e.message, 'error');
+      if (!isAutoDelete3R) showToast('清除失敗：' + e.message, 'error');
     }
   }
 
@@ -1334,6 +1689,7 @@
       });
       if (res.success) {
         state.records = {};
+        state.lastResetAllAt = res.lastResetAllAt || Date.now();
         state.lastActivityAt = res.lastActivityAt || Date.now();
         saveLocalCloudCache();
         showToast(
@@ -1342,10 +1698,7 @@
             : '🧹 已將所有頻道紀錄重置清空！',
           'warn'
         );
-        renderTopBossTabs();
-        renderServerGridBadges();
-        renderSingleBossView();
-        renderSingleBossServerList();
+        refreshAllViews();
       }
     } catch (e) {
       if (!isAuto) showToast('重置失敗：' + e.message, 'error');
@@ -1361,18 +1714,18 @@
     state.config.servers.forEach(srv => {
       const srvRecs = state.records[srv] || {};
       Object.values(srvRecs).forEach(rec => {
-        if (!rec || !rec.respawnAt) return;
-        const diffMs = rec.respawnAt - now;
-        if (diffMs <= 15 * 60 * 1000) {
+        if (!rec) return;
+        const cycle = computeRecordCycle(rec, now);
+        if (!cycle.expired && cycle.diffMs <= 15 * 60 * 1000) {
           allItems.push({
             ...rec,
-            diffMs
+            cycle
           });
         }
       });
     });
 
-    allItems.sort((a, b) => a.diffMs - b.diffMs);
+    allItems.sort((a, b) => a.cycle.diffMs - b.cycle.diffMs);
 
     if (allItems.length === 0) {
       el.radarTableBody.innerHTML = `
@@ -1387,9 +1740,10 @@
     }
 
     allItems.forEach(item => {
+      const { cycle } = item;
       const tr = document.createElement('tr');
-      const isAlive = item.diffMs <= 0;
-      const remainSec = Math.ceil(Math.abs(item.diffMs) / 1000);
+      const isAlive = cycle.diffMs <= 0;
+      const remainSec = Math.ceil(Math.abs(cycle.diffMs) / 1000);
 
       const statusBadge = isAlive
         ? '<span class="boss-status-badge badge-alive">🟢 已重生</span>'
@@ -1401,10 +1755,10 @@
 
       tr.innerHTML = `
         <td><span class="radar-server-tag">${item.serverId}</span></td>
-        <td style="font-weight: 700;">${item.bossName} ${item.autoAdjusted30m ? '<span class="auto-30m-badge">重生15分轉30分</span>' : ''}</td>
+        <td style="font-weight: 700;">${item.bossName} ${getRoundTagHtml(cycle.round)}</td>
         <td style="font-family: var(--font-mono); font-weight: 700; color: ${isAlive ? 'var(--accent-green)' : 'var(--accent-yellow)'}">${countdownText}</td>
-        <td>${formatTime(new Date(item.respawnAt))}</td>
-        <td>${formatTime(new Date(item.killedAt))} (${item.reporter || '未知'})</td>
+        <td>${formatTime(new Date(cycle.phaseRespawnAt))}</td>
+        <td>${formatTime(new Date(cycle.phaseStartAt))} (${item.reporter || '未知'})</td>
         <td>${statusBadge}</td>
         <td>
           <button class="btn btn-secondary btn-sm" data-jump-srv="${item.serverId}" data-jump-boss="${item.bossId}">
@@ -1444,7 +1798,9 @@
       if (log.type === 'KILL') {
         typeHtml = '<span style="color: var(--accent-green)">擊殺回報</span>';
       } else if (log.type === 'AUTO_30M') {
-        typeHtml = '<span style="color: var(--accent-yellow)">⚡ 重生15分未編輯改倒數30分</span>';
+        typeHtml = '<span style="color: #c084fc">🟣 自動進入下一輪(30分)</span>';
+      } else if (log.type === 'AUTO_DEL_3R') {
+        typeHtml = '<span style="color: #fb923c">🗑️ 滿三輪未編輯自動刪除</span>';
       } else if (log.type === 'AUTO_RESET_3H') {
         typeHtml = '<span style="color: var(--accent-red)">⏰ 閒置3小時全服重置</span>';
       }
@@ -1510,49 +1866,47 @@
       }
     }
 
-    // Rule 3 & Alerts: Check across all servers
+    // Rule 2 & Alerts: Check 3-Round transitions & expiration across all servers
     state.config.servers.forEach(srv => {
       const srvRecs = state.records[srv];
       if (!srvRecs) return;
 
       Object.values(srvRecs).forEach(rec => {
-        if (!rec || !rec.respawnAt) return;
+        if (!rec) return;
+        const cycle = computeRecordCycle(rec, now);
 
-        // Rule 3: Whenever a channel is unedited for 15 minutes after boss respawn (respawnAt), automatically set it to countdown 30 minutes (can trigger repeatedly each cycle)
-        if (now - rec.respawnAt >= FIFTEEN_MINS_MS) {
-          let newKilledAt = rec.killedAt;
-          let newRespawnAt = rec.respawnAt;
-          while (now - newRespawnAt >= FIFTEEN_MINS_MS) {
-            newKilledAt = newRespawnAt + FIFTEEN_MINS_MS;
-            newRespawnAt = newKilledAt + THIRTY_MINS_MS;
-          }
-          const newNote = (rec.note && rec.note.includes('自動'))
-            ? rec.note
-            : (rec.note ? `${rec.note} (重生15分未編輯自動倒數30分)` : '重生後15分未編輯，自動改為倒數30分');
-          // Update local record immediately so next tick won't duplicate before async save finishes
-          rec.killedAt = newKilledAt;
-          rec.respawnMinutes = 30;
-          rec.respawnAt = newRespawnAt;
-          rec.autoAdjusted30m = true;
-          rec.updatedAt = now;
-          saveBossRecord(srv, rec.bossId, newKilledAt, 30, newNote, true);
+        // If 3 rounds have finished without manual edit -> Auto-Delete!
+        if (cycle.expired) {
+          delete srvRecs[rec.bossId];
+          clearBossRecord(srv, rec.bossId, rec.bossName, true);
           return;
         }
 
-        const diffMs = rec.respawnAt - now;
-        const cacheKey0m = `${srv}_${rec.bossId}_${rec.respawnAt}_0m`;
-        const cacheKey1m = `${srv}_${rec.bossId}_${rec.respawnAt}_1m`;
-        const cacheKeyThresh = `${srv}_${rec.bossId}_${rec.respawnAt}_thresh`;
+        // Notify when transitioning into Round 2 or Round 3
+        const roundKey = `${srv}_${rec.bossId}_${rec.baseKilledAt || rec.killedAt}_r${cycle.round}`;
+        if (!state.notifiedRoundCache.has(roundKey)) {
+          state.notifiedRoundCache.add(roundKey);
+          if (cycle.round === 2) {
+            showToast(`🟣 [${srv}] ${rec.bossName} 重生滿 15 分鐘未編輯，已進入「第二輪」倒數 30 分鐘！`, 'warn');
+          } else if (cycle.round === 3) {
+            showToast(`🟠 [${srv}] ${rec.bossName} 已進入「第三輪(最終輪)」倒數 30 分鐘（若再無編輯將自動刪除）！`, 'warn');
+          }
+        }
+
+        const diffMs = cycle.diffMs;
+        const cacheKey0m = `${srv}_${rec.bossId}_${cycle.phaseRespawnAt}_0m`;
+        const cacheKey1m = `${srv}_${rec.bossId}_${cycle.phaseRespawnAt}_1m`;
+        const cacheKeyThresh = `${srv}_${rec.bossId}_${cycle.phaseRespawnAt}_thresh`;
 
         if (diffMs <= 0 && !state.alertedCache.has(cacheKey0m)) {
           state.alertedCache.add(cacheKey0m);
-          triggerAlert(srv, rec.bossName, 0);
+          triggerAlert(srv, `${rec.bossName} (第${cycle.round}輪)`, 0);
         } else if (diffMs > 0 && diffMs <= 60 * 1000 && !state.alertedCache.has(cacheKey1m)) {
           state.alertedCache.add(cacheKey1m);
-          triggerAlert(srv, rec.bossName, 1);
+          triggerAlert(srv, `${rec.bossName} (第${cycle.round}輪)`, 1);
         } else if (diffMs > 60 * 1000 && diffMs <= threshMs && !state.alertedCache.has(cacheKeyThresh)) {
           state.alertedCache.add(cacheKeyThresh);
-          triggerAlert(srv, rec.bossName, Math.ceil(diffMs / 60000));
+          triggerAlert(srv, `${rec.bossName} (第${cycle.round}輪)`, Math.ceil(diffMs / 60000));
         }
       });
     });
@@ -1651,11 +2005,8 @@
             state.config.bosses = state.config.bosses.filter(b => b.id !== boss.id);
             saveLocalCloudCache();
             getActiveBoss();
-            renderTopBossTabs();
             renderBossManagerList();
-            renderServerGridBadges();
-            renderSingleBossView();
-            renderSingleBossServerList();
+            refreshAllViews();
             showToast('已刪除王怪', 'info');
           }
         } catch (e) {
@@ -1680,9 +2031,8 @@
         const idx = state.config.bosses.findIndex(b => b.id === updatedBoss.id);
         if (idx !== -1) state.config.bosses[idx] = res.boss;
         saveLocalCloudCache();
-        renderTopBossTabs();
         renderBossManagerList();
-        renderSingleBossView();
+        refreshAllViews();
         showToast(`✅ 已將「${updatedBoss.name}」預設復活時間設為 ${formatMinutes(updatedBoss.respawnMinutes)}`, 'success');
       }
     } catch (e) {
@@ -1828,6 +2178,22 @@
     });
     el.btnSwitchUser.addEventListener('click', () => promptAuth());
 
+    // Manual Sync Buttons & Tab Focus Auto-Sync
+    if (el.btnManualSync) {
+      el.btnManualSync.addEventListener('click', () => syncNow(true));
+    }
+    if (el.btnListSync) {
+      el.btnListSync.addEventListener('click', () => syncNow(true));
+    }
+    window.addEventListener('focus', () => {
+      if (state.currentUser) syncNow(false);
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && state.currentUser) {
+        syncNow(false);
+      }
+    });
+
     // Inline Quick Add Boss at the very top
     if (el.btnInlineAddBoss) {
       el.btnInlineAddBoss.addEventListener('click', async () => {
@@ -1901,9 +2267,7 @@
       el.selectAlertMinutes.addEventListener('change', () => {
         state.alertThresholdMinutes = parseInt(el.selectAlertMinutes.value, 10) || 5;
         localStorage.setItem('boss_alert_minutes', String(state.alertThresholdMinutes));
-        renderServerGridBadges();
-        renderSingleBossView();
-        renderSingleBossServerList();
+        refreshAllViews();
         showToast(`⏰ 已設定於王復活前 ${state.alertThresholdMinutes} 分鐘發出提醒！`, 'info');
       });
     }
